@@ -22,6 +22,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/relscan.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -39,6 +40,7 @@
 #include "nodes/makefuncs.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
+#include "storage/block.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -130,6 +132,10 @@ typedef struct CopyStateData {
 	int chunk; /* the chunk number (from the split):
 	 1 means that first 1/4th of the output is generated,
 	 2 means that the second 1/4th of the output is generated */
+	/* we scan the file page-wise - not row by row - for example,
+	 * for split 4, chunk 3, we could return pages: 2,5,8, and so on */
+	/* how many pages do we scan in one go for a chunk */
+	int sequence;
 
 	/* these are just for error messages, see CopyFromErrorCallback */
 	const char *cur_relname; /* table name for error messages */
@@ -893,6 +899,7 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 	if (!cstate->split) {
 		cstate->split = -1;
 		cstate->chunk = -1;
+		cstate->sequence = -1;
 	}
 
 	/* Extract options from the statement node tree */
@@ -1022,6 +1029,17 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 			if (cstate->chunk < 0 || cstate->chunk >= cstate->split)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 0) and (less than value of SPLIT)", defel->defname)));
+		} else if (strcmp(defel->defname, "sequence") == 0) {
+			if (cstate->sequence != -1)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+			if (cstate->split == -1 || cstate->chunk == -1)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("cannot specify  without SPLIT and CHUNK mode (SPLIT and CHUNK have to be specified before PAGED)")));
+			cstate->sequence = defGetInt32(defel);
+			if (cstate->sequence < 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 1)", defel->defname)));
 		} else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR), errmsg("option \"%s\" not recognized", defel->defname)));
@@ -1707,6 +1725,8 @@ static uint64 CopyTo(CopyState cstate) {
 		HeapTuple tuple;
 		int split = cstate->split;
 		int chunk = cstate->chunk;
+		/* how many pages to read in sequence */
+		int sequence = cstate->sequence;
 		/* count tuples which were read from the heap file */
 		int counter = 0;
 
@@ -1714,6 +1734,7 @@ static uint64 CopyTo(CopyState cstate) {
 		nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 
 		scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
+
 		processed = 0;
 		/* the process of generating output data from tuples is contained in
 		 * the while loop and its execution should be optimized */
@@ -1728,7 +1749,7 @@ static uint64 CopyTo(CopyState cstate) {
 				CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
 				++processed;
 			}
-		} else { /* (2) split the output and send only a single chunk */
+		} else if (sequence == -1) { /* (2) split the output and send only a single chunk */
 			while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 					!= NULL) {
 				CHECK_FOR_INTERRUPTS();
@@ -1740,6 +1761,25 @@ static uint64 CopyTo(CopyState cstate) {
 					++processed;
 				}
 				++counter;
+			}
+		} else { /* paged processing */
+			BlockNumber global_page; /* starting page of a sequence */
+			BlockNumber npages = scandesc->rs_nblocks; /* total number of pages in the relation */
+			BlockNumber stride = (split * sequence); /* what is the stride after reading current sequence of pages */
+
+			for (global_page = chunk * sequence; global_page < npages;
+					global_page += stride) {
+				scandesc->rs_numblocks = sequence; /* allow to scan the sequence of pages at a time at most */
+				heapgetpage(scandesc, global_page);
+				while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
+						!= NULL) {
+					CHECK_FOR_INTERRUPTS();
+					/* Deconstruct the tuple ... faster than repeated heap_getattr */
+					heap_deform_tuple(tuple, tupDesc, values, nulls);
+					/* Format and send the data */
+					CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
+					++processed;
+				}
 			}
 		}
 		heap_endscan(scandesc);
