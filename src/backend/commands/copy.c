@@ -1038,6 +1038,7 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("cannot specify  without SPLIT and CHUNK mode (SPLIT and CHUNK have to be specified before PAGED)")));
 			cstate->sequence = defGetInt32(defel);
+			/* this is important */
 			if (cstate->sequence < -2 || cstate->sequence == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 1 or equal -1 for row by row processing)", defel->defname)));
