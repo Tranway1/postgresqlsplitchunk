@@ -19,7 +19,7 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
+#include <math.h>
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/relscan.h"
@@ -1733,13 +1733,13 @@ static uint64 CopyTo(CopyState cstate) {
 		values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
 		nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 
-		scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
-
 		processed = 0;
 		/* the process of generating output data from tuples is contained in
 		 * the while loop and its execution should be optimized */
 		/* (1) no splitting */
 		if (chunk == -1) {
+			scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0,
+			NULL);
 			while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 					!= NULL) {
 				CHECK_FOR_INTERRUPTS();
@@ -1749,7 +1749,10 @@ static uint64 CopyTo(CopyState cstate) {
 				CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
 				++processed;
 			}
+			heap_endscan(scandesc);
 		} else if (sequence == -1) { /* (2) split the output and send only a single chunk */
+			scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0,
+			NULL);
 			while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 					!= NULL) {
 				CHECK_FOR_INTERRUPTS();
@@ -1762,15 +1765,17 @@ static uint64 CopyTo(CopyState cstate) {
 				}
 				++counter;
 			}
+			heap_endscan(scandesc);
 		} else { /* paged processing */
 			BlockNumber global_page; /* starting page of a sequence */
-			BlockNumber npages = scandesc->rs_nblocks; /* total number of pages in the relation */
-			BlockNumber stride = (split * sequence); /* what is the stride after reading current sequence of pages */
-
+			BlockNumber npages; /* total number of pages in the relation */
+			BlockNumber stride = (split * sequence); /* what is the stride (or jump) after reading current sequence of pages */
+			scandesc = heap_beginscan_strat(cstate->rel, GetActiveSnapshot(), 0,
+			NULL, true, false);
+			npages = scandesc->rs_nblocks;
 			for (global_page = chunk * sequence; global_page < npages;
 					global_page += stride) {
-				scandesc->rs_numblocks = sequence; /* allow to scan the sequence of pages at a time at most */
-				heapgetpage(scandesc, global_page);
+				heap_setscanlimits(scandesc, global_page, sequence);
 				while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 						!= NULL) {
 					CHECK_FOR_INTERRUPTS();
@@ -1781,8 +1786,8 @@ static uint64 CopyTo(CopyState cstate) {
 					++processed;
 				}
 			}
+			heap_endscan(scandesc);
 		}
-		heap_endscan(scandesc);
 
 		pfree(values);
 		pfree(nulls);
