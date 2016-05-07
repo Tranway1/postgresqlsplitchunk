@@ -41,6 +41,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "storage/block.h"
+#include "storage/bufmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -1037,9 +1038,9 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("cannot specify  without SPLIT and CHUNK mode (SPLIT and CHUNK have to be specified before PAGED)")));
 			cstate->sequence = defGetInt32(defel);
-			if (cstate->sequence < 1)
+			if (cstate->sequence < -2 || cstate->sequence == 0)
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 1)", defel->defname)));
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 1 or equal -1 for row by row processing)", defel->defname)));
 		} else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR), errmsg("option \"%s\" not recognized", defel->defname)));
@@ -1768,14 +1769,16 @@ static uint64 CopyTo(CopyState cstate) {
 			heap_endscan(scandesc);
 		} else { /* paged processing */
 			BlockNumber global_page; /* starting page of a sequence */
-			BlockNumber npages; /* total number of pages in the relation */
+			BlockNumber npages = RelationGetNumberOfBlocks(cstate->rel); /* total number of pages in the relation */
 			BlockNumber stride = (split * sequence); /* what is the stride (or jump) after reading current sequence of pages */
 			scandesc = heap_beginscan_strat(cstate->rel, GetActiveSnapshot(), 0,
 			NULL, true, false);
-			npages = scandesc->rs_nblocks;
 			for (global_page = chunk * sequence; global_page < npages;
 					global_page += stride) {
+				heap_rescan(scandesc,NULL);
 				heap_setscanlimits(scandesc, global_page, sequence);
+				/* initiate the scan from a new block */
+				scandesc->rs_inited = false;
 				while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 						!= NULL) {
 					CHECK_FOR_INTERRUPTS();
