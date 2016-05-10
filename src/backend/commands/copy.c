@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include <stdio.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -1016,9 +1017,9 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
 			cstate->split = defGetInt32(defel);
-			if (cstate->split < 2)
+			if (cstate->split < 1)
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be greater than 1", defel->defname)));
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be greater than 0 (value 1 means that only a single file is generated for the whole output data)", defel->defname)));
 		} else if (strcmp(defel->defname, "chunk") == 0) {
 			if (cstate->chunk != -1)
 				ereport(ERROR,
@@ -1029,7 +1030,7 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 			cstate->chunk = defGetInt32(defel);
 			if (cstate->chunk < 0 || cstate->chunk >= cstate->split)
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 0) and (less than value of SPLIT)", defel->defname)));
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 0) and (less than value of SPLIT); chunks are counted from 0", defel->defname)));
 		} else if (strcmp(defel->defname, "sequence") == 0) {
 			if (cstate->sequence != -1)
 				ereport(ERROR,
@@ -1731,7 +1732,13 @@ static uint64 CopyTo(CopyState cstate) {
 		int sequence = cstate->sequence;
 		/* count tuples which were read from the heap file */
 		int counter = 0;
-
+		//FILE * fp;
+		//char file_name[100];
+		//char chunk_name[20];
+		//strcpy(file_name, "/tmp/postgresql_blocks.log");
+		//snprintf(chunk_name, sizeof(cstate->chunk), "%d", cstate->chunk);
+		//strcat(file_name, chunk_name);
+		//fp = fopen(file_name, "a");
 		values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
 		nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 
@@ -1740,11 +1747,18 @@ static uint64 CopyTo(CopyState cstate) {
 		 * the while loop and its execution should be optimized */
 		/* (1) no splitting */
 		if (chunk == -1) {
+			//BlockNumber previousBlock = -1; /* for debug */
 			scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0,
 			NULL);
 			while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 					!= NULL) {
 				CHECK_FOR_INTERRUPTS();
+				/*// debug
+				 if (previousBlock != scandesc->rs_cblock) {
+				 fprintf(fp, "block number: %d\n", scandesc->rs_cblock);
+				 previousBlock = scandesc->rs_cblock;
+				 }
+				 */
 				/* Deconstruct the tuple ... faster than repeated heap_getattr */
 				heap_deform_tuple(tuple, tupDesc, values, nulls);
 				/* Format and send the data */
@@ -1769,32 +1783,49 @@ static uint64 CopyTo(CopyState cstate) {
 			}
 			heap_endscan(scandesc);
 		} else { /* paged processing */
-			BlockNumber global_page; /* starting page of a sequence */
-			BlockNumber npages = RelationGetNumberOfBlocks(cstate->rel); /* total number of pages in the relation */
+			BlockNumber global_page_nr; /* global page number that we are currently processing */
+			//BlockNumber previousBlock = -1; /* for debug */
+			BlockNumber npages = RelationGetNumberOfBlocks(cstate->rel); /* total number of pages in the relation - it is numbered from 0 so the last page number to process is npages-1 */
 			BlockNumber stride = (split * sequence); /* what is the stride (or jump) after reading current sequence of pages */
+			BlockNumber chunk_position_in_stride = (chunk * sequence); /* denotes the chunk number (position) within the stride */
+			BlockNumber start_page;
 			scandesc = heap_beginscan_strat(cstate->rel, GetActiveSnapshot(), 0,
 			NULL, true, false);
-			for (global_page = chunk * sequence; global_page < npages;
-					global_page += stride) {
-				heap_rescan(scandesc,NULL);
-				heap_setscanlimits(scandesc, global_page, sequence);
+			start_page = scandesc->rs_startblock; /* the page number from which to start scanning, this is also an "address" of the first stride */
+			//fprintf(fp, "number of pages: %d\n", npages);
+			for (global_page_nr = start_page + chunk_position_in_stride;
+					global_page_nr < npages; global_page_nr += stride) {
+				/* alternative (slow): iterate the pages in the current chunk one by one
+				 for (current_page = global_page;
+				 current_page < global_page + sequence; ++current_page) {
+				 */
+				heap_rescan(scandesc, NULL);
+				heap_setscanlimits(scandesc, global_page_nr, sequence); /* sequence == how many pages to scan */
 				/* initiate the scan from a new block */
 				scandesc->rs_inited = false;
+
 				while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
 						!= NULL) {
 					CHECK_FOR_INTERRUPTS();
+					/*// debug
+					 if (previousBlock != scandesc->rs_cblock) {
+					 fprintf(fp, "block number: %d\n", scandesc->rs_cblock);
+					 previousBlock = scandesc->rs_cblock;
+					 } */
 					/* Deconstruct the tuple ... faster than repeated heap_getattr */
 					heap_deform_tuple(tuple, tupDesc, values, nulls);
 					/* Format and send the data */
 					CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
 					++processed;
 				}
+				/*}*/
 			}
 			heap_endscan(scandesc);
 		}
 
 		pfree(values);
 		pfree(nulls);
+		// fclose(fp); /* close file for debug output */
 	} else {
 		/* run the plan --- the dest receiver will send tuples */
 		ExecutorRun(cstate->queryDesc, ForwardScanDirection, 0L);
@@ -1809,7 +1840,6 @@ static uint64 CopyTo(CopyState cstate) {
 	}
 
 	MemoryContextDelete(cstate->rowcontext);
-
 	return processed;
 }
 
