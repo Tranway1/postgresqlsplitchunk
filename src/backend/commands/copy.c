@@ -1784,6 +1784,7 @@ static uint64 CopyTo(CopyState cstate) {
 			heap_endscan(scandesc);
 		} else { /* paged processing */
 			BlockNumber global_page_nr; /* global page number that we are currently processing */
+			BlockNumber current_page_nr; /* global page number that we are currently processing */
 			//BlockNumber previousBlock = -1; /* for debug */
 			BlockNumber npages = RelationGetNumberOfBlocks(cstate->rel); /* total number of pages in the relation - it is numbered from 0 so the last page number to process is npages-1 */
 			BlockNumber stride = (split * sequence); /* what is the stride (or jump) after reading current sequence of pages */
@@ -1795,30 +1796,31 @@ static uint64 CopyTo(CopyState cstate) {
 			//fprintf(fp, "number of pages: %d\n", npages);
 			for (global_page_nr = start_page + chunk_position_in_stride;
 					global_page_nr < npages; global_page_nr += stride) {
-				/* alternative (slow): iterate the pages in the current chunk one by one
-				 for (current_page = global_page;
-				 current_page < global_page + sequence; ++current_page) {
-				 */
-				heap_rescan(scandesc, NULL);
-				heap_setscanlimits(scandesc, global_page_nr, sequence); /* sequence == how many pages to scan */
-				/* initiate the scan from a new block */
-				scandesc->rs_inited = false;
+				/* alternative (slow): iterate the pages in the current chunk one by one */
+				for (current_page_nr = global_page_nr;
+						(current_page_nr < global_page_nr + sequence) && (current_page_nr < npages);
+						++current_page_nr) {
+					heap_rescan(scandesc, NULL);
+					heap_setscanlimits(scandesc, current_page_nr, 1); /* sequence == how many pages to scan */
+					/* initiate the scan from a new block */
+					scandesc->rs_inited = false;
 
-				while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
-						!= NULL) {
-					CHECK_FOR_INTERRUPTS();
-					/*// debug
-					 if (previousBlock != scandesc->rs_cblock) {
-					 fprintf(fp, "block number: %d\n", scandesc->rs_cblock);
-					 previousBlock = scandesc->rs_cblock;
-					 } */
-					/* Deconstruct the tuple ... faster than repeated heap_getattr */
-					heap_deform_tuple(tuple, tupDesc, values, nulls);
-					/* Format and send the data */
-					CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
-					++processed;
+					while ((tuple = heap_getnext(scandesc, ForwardScanDirection))
+							!= NULL) {
+						CHECK_FOR_INTERRUPTS();
+						/*// debug
+						 if (previousBlock != scandesc->rs_cblock) {
+						 fprintf(fp, "block number: %d\n", scandesc->rs_cblock);
+						 previousBlock = scandesc->rs_cblock;
+						 } */
+						/* Deconstruct the tuple ... faster than repeated heap_getattr */
+						heap_deform_tuple(tuple, tupDesc, values, nulls);
+						/* Format and send the data */
+						CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values,
+								nulls);
+						++processed;
+					}
 				}
-				/*}*/
 			}
 			heap_endscan(scandesc);
 		}
