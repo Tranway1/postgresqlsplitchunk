@@ -1726,6 +1726,8 @@ static uint64 CopyTo(CopyState cstate) {
 		bool *nulls;
 		HeapScanDesc scandesc;
 		HeapTuple tuple;
+
+		/* Adam's changes */
 		int split = cstate->split;
 		int chunk = cstate->chunk;
 		/* how many pages to read in sequence */
