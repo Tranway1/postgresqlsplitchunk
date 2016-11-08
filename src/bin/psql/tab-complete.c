@@ -599,8 +599,10 @@ static const SchemaQuery Query_for_list_of_matviews = {
 "        OR '\"' || nspname || '\"' ='%s') "
 
 #define Query_for_list_of_template_databases \
-"SELECT pg_catalog.quote_ident(datname) FROM pg_catalog.pg_database "\
-" WHERE substring(pg_catalog.quote_ident(datname),1,%d)='%s' AND datistemplate"
+"SELECT pg_catalog.quote_ident(d.datname) "\
+"  FROM pg_catalog.pg_database d "\
+" WHERE substring(pg_catalog.quote_ident(d.datname),1,%d)='%s' "\
+"   AND (d.datistemplate OR pg_catalog.pg_has_role(d.datdba, 'USAGE'))"
 
 #define Query_for_list_of_databases \
 "SELECT pg_catalog.quote_ident(datname) FROM pg_catalog.pg_database "\
@@ -816,6 +818,13 @@ static const SchemaQuery Query_for_list_of_matviews = {
 /* the silly-looking length condition is just to eat up the current word */
 #define Query_for_list_of_available_extension_versions \
 " SELECT pg_catalog.quote_ident(version) "\
+"   FROM pg_catalog.pg_available_extension_versions "\
+"  WHERE (%d = pg_catalog.length('%s'))"\
+"    AND pg_catalog.quote_ident(name)='%s'"
+
+/* the silly-looking length condition is just to eat up the current word */
+#define Query_for_list_of_available_extension_versions_with_TO \
+" SELECT 'TO ' || pg_catalog.quote_ident(version) "\
 "   FROM pg_catalog.pg_available_extension_versions "\
 "  WHERE (%d = pg_catalog.length('%s'))"\
 "    AND pg_catalog.quote_ident(name)='%s'"
@@ -1276,7 +1285,7 @@ psql_completion(const char *text, int start, int end)
 	static const char *const backslash_commands[] = {
 		"\\a", "\\connect", "\\conninfo", "\\C", "\\cd", "\\copy",
 		"\\copyright", "\\crosstabview",
-		"\\d", "\\da", "\\db", "\\dc", "\\dC", "\\dd", "\\ddp", "\\dD",
+		"\\d", "\\da", "\\dA", "\\db", "\\dc", "\\dC", "\\dd", "\\ddp", "\\dD",
 		"\\des", "\\det", "\\deu", "\\dew", "\\dE", "\\df",
 		"\\dF", "\\dFd", "\\dFp", "\\dFt", "\\dg", "\\di", "\\dl", "\\dL",
 		"\\dm", "\\dn", "\\do", "\\dO", "\\dp", "\\drds", "\\ds", "\\dS",
@@ -1414,6 +1423,20 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches3("ALTER", "EXTENSION", MatchAny))
 		COMPLETE_WITH_LIST4("ADD", "DROP", "UPDATE", "SET SCHEMA");
 
+	/* ALTER EXTENSION <name> UPDATE */
+	else if (Matches4("ALTER", "EXTENSION", MatchAny, "UPDATE"))
+	{
+		completion_info_charp = prev2_wd;
+		COMPLETE_WITH_QUERY(Query_for_list_of_available_extension_versions_with_TO);
+	}
+
+	/* ALTER EXTENSION <name> UPDATE TO */
+	else if (Matches5("ALTER", "EXTENSION", MatchAny, "UPDATE", "TO"))
+	{
+		completion_info_charp = prev3_wd;
+		COMPLETE_WITH_QUERY(Query_for_list_of_available_extension_versions);
+	}
+
 	/* ALTER FOREIGN */
 	else if (Matches2("ALTER", "FOREIGN"))
 		COMPLETE_WITH_LIST2("DATA WRAPPER", "TABLE");
@@ -1548,7 +1571,7 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER SERVER <name> */
 	else if (Matches3("ALTER", "SERVER", MatchAny))
 		COMPLETE_WITH_LIST4("VERSION", "OPTIONS", "OWNER TO", "RENAME TO");
-	/* ALTER SERVER <name> VERSION <version>*/
+	/* ALTER SERVER <name> VERSION <version> */
 	else if (Matches5("ALTER", "SERVER", MatchAny, "VERSION", MatchAny))
 		COMPLETE_WITH_CONST("OPTIONS");
 	/* ALTER SYSTEM SET, RESET, RESET ALL */
@@ -1784,7 +1807,7 @@ psql_completion(const char *text, int start, int end)
 			"autovacuum_vacuum_scale_factor",
 			"autovacuum_vacuum_threshold",
 			"fillfactor",
-			"parallel_degree",
+			"parallel_workers",
 			"log_autovacuum_min_duration",
 			"toast.autovacuum_enabled",
 			"toast.autovacuum_freeze_max_age",
@@ -1873,8 +1896,11 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches5("ALTER", "GROUP", MatchAny, "ADD|DROP", "USER"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_roles);
 
-/* BEGIN, END, ABORT */
-	else if (Matches1("BEGIN|END|ABORT"))
+/* BEGIN */
+	else if (Matches1("BEGIN"))
+		COMPLETE_WITH_LIST6("WORK", "TRANSACTION", "ISOLATION LEVEL", "READ", "DEFERRABLE", "NOT DEFERRABLE");
+/* END, ABORT */
+	else if (Matches1("END|ABORT"))
 		COMPLETE_WITH_LIST2("WORK", "TRANSACTION");
 /* COMMIT */
 	else if (Matches1("COMMIT"))
@@ -1910,7 +1936,8 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches2("COMMENT", "ON"))
 	{
 		static const char *const list_COMMENT[] =
-		{"CAST", "COLLATION", "CONVERSION", "DATABASE", "EVENT TRIGGER", "EXTENSION",
+		{"ACCESS METHOD", "CAST", "COLLATION", "CONVERSION", "DATABASE",
+			"EVENT TRIGGER", "EXTENSION",
 			"FOREIGN DATA WRAPPER", "FOREIGN TABLE",
 			"SERVER", "INDEX", "LANGUAGE", "POLICY", "RULE", "SCHEMA", "SEQUENCE",
 			"TABLE", "TYPE", "VIEW", "MATERIALIZED VIEW", "COLUMN", "AGGREGATE", "FUNCTION",
@@ -1919,6 +1946,8 @@ psql_completion(const char *text, int start, int end)
 
 		COMPLETE_WITH_LIST(list_COMMENT);
 	}
+	else if (Matches4("COMMENT", "ON", "ACCESS", "METHOD"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_access_methods);
 	else if (Matches3("COMMENT", "ON", "FOREIGN"))
 		COMPLETE_WITH_LIST2("DATA WRAPPER", "TABLE");
 	else if (Matches4("COMMENT", "ON", "TEXT", "SEARCH"))
@@ -2027,8 +2056,11 @@ psql_completion(const char *text, int start, int end)
 	/* First off we complete CREATE UNIQUE with "INDEX" */
 	else if (TailMatches2("CREATE", "UNIQUE"))
 		COMPLETE_WITH_CONST("INDEX");
-	/* If we have CREATE|UNIQUE INDEX, then add "ON", "CONCURRENTLY",
-	   and existing indexes */
+
+	/*
+	 * If we have CREATE|UNIQUE INDEX, then add "ON", "CONCURRENTLY", and
+	 * existing indexes
+	 */
 	else if (TailMatches2("CREATE|UNIQUE", "INDEX"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes,
 								   " UNION SELECT 'ON'"
@@ -2037,7 +2069,11 @@ psql_completion(const char *text, int start, int end)
 	else if (TailMatches3("INDEX|CONCURRENTLY", MatchAny, "ON") ||
 			 TailMatches2("INDEX|CONCURRENTLY", "ON"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tm, NULL);
-	/* Complete CREATE|UNIQUE INDEX CONCURRENTLY with "ON" and existing indexes */
+
+	/*
+	 * Complete CREATE|UNIQUE INDEX CONCURRENTLY with "ON" and existing
+	 * indexes
+	 */
 	else if (TailMatches3("CREATE|UNIQUE", "INDEX", "CONCURRENTLY"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes,
 								   " UNION SELECT 'ON'");
@@ -2173,9 +2209,43 @@ psql_completion(const char *text, int start, int end)
 	/* complete CREATE TRIGGER ... INSTEAD OF event ON with a list of views */
 	else if (TailMatches7("CREATE", "TRIGGER", MatchAny, "INSTEAD", "OF", MatchAny, "ON"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_views, NULL);
+	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches2("ON", MatchAny))
+		COMPLETE_WITH_LIST7("NOT DEFERRABLE", "DEFERRABLE", "INITIALLY",
+							"REFERENCING", "FOR", "WHEN (", "EXECUTE PROCEDURE");
+	else if (HeadMatches2("CREATE", "TRIGGER") &&
+			 (TailMatches1("DEFERRABLE") || TailMatches2("INITIALLY", "IMMEDIATE|DEFERRED")))
+		COMPLETE_WITH_LIST4("REFERENCING", "FOR", "WHEN (", "EXECUTE PROCEDURE");
+	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches1("REFERENCING"))
+		COMPLETE_WITH_LIST2("OLD TABLE", "NEW TABLE");
+	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches2("OLD|NEW", "TABLE"))
+		COMPLETE_WITH_CONST("AS");
+	else if (HeadMatches2("CREATE", "TRIGGER") &&
+			 (TailMatches5("REFERENCING", "OLD", "TABLE", "AS", MatchAny) ||
+			  TailMatches4("REFERENCING", "OLD", "TABLE", MatchAny)))
+		COMPLETE_WITH_LIST4("NEW TABLE", "FOR", "WHEN (", "EXECUTE PROCEDURE");
+	else if (HeadMatches2("CREATE", "TRIGGER") &&
+			 (TailMatches5("REFERENCING", "NEW", "TABLE", "AS", MatchAny) ||
+			  TailMatches4("REFERENCING", "NEW", "TABLE", MatchAny)))
+		COMPLETE_WITH_LIST4("OLD TABLE", "FOR", "WHEN (", "EXECUTE PROCEDURE");
+	else if (HeadMatches2("CREATE", "TRIGGER") &&
+			 (TailMatches9("REFERENCING", "OLD|NEW", "TABLE", "AS", MatchAny, "OLD|NEW", "TABLE", "AS", MatchAny) ||
+			  TailMatches8("REFERENCING", "OLD|NEW", "TABLE", MatchAny, "OLD|NEW", "TABLE", "AS", MatchAny) ||
+			  TailMatches8("REFERENCING", "OLD|NEW", "TABLE", "AS", MatchAny, "OLD|NEW", "TABLE", MatchAny) ||
+			  TailMatches7("REFERENCING", "OLD|NEW", "TABLE", MatchAny, "OLD|NEW", "TABLE", MatchAny)))
+		COMPLETE_WITH_LIST3("FOR", "WHEN (", "EXECUTE PROCEDURE");
+	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches1("FOR"))
+		COMPLETE_WITH_LIST3("EACH", "ROW", "STATEMENT");
+	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches2("FOR", "EACH"))
+		COMPLETE_WITH_LIST2("ROW", "STATEMENT");
+	else if (HeadMatches2("CREATE", "TRIGGER") &&
+			 (TailMatches3("FOR", "EACH", "ROW|STATEMENT") ||
+			  TailMatches2("FOR", "ROW|STATEMENT")))
+		COMPLETE_WITH_LIST2("WHEN (", "EXECUTE PROCEDURE");
 	/* complete CREATE TRIGGER ... EXECUTE with PROCEDURE */
 	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches1("EXECUTE"))
 		COMPLETE_WITH_CONST("PROCEDURE");
+	else if (HeadMatches2("CREATE", "TRIGGER") && TailMatches2("EXECUTE", "PROCEDURE"))
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_functions, NULL);
 
 /* CREATE ROLE,USER,GROUP <name> */
 	else if (Matches3("CREATE", "ROLE|GROUP|USER", MatchAny) &&
@@ -2330,6 +2400,12 @@ psql_completion(const char *text, int start, int end)
 	}
 	else if (Matches5("DROP", "TRIGGER", MatchAny, "ON", MatchAny))
 		COMPLETE_WITH_LIST2("CASCADE", "RESTRICT");
+
+	/* DROP ACCESS METHOD */
+	else if (Matches2("DROP", "ACCESS"))
+		COMPLETE_WITH_CONST("METHOD");
+	else if (Matches3("DROP", "ACCESS", "METHOD"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_access_methods);
 
 	/* DROP EVENT TRIGGER */
 	else if (Matches2("DROP", "EVENT"))
@@ -2620,6 +2696,17 @@ psql_completion(const char *text, int start, int end)
 							"SHARE ROW EXCLUSIVE MODE",
 							"EXCLUSIVE MODE", "ACCESS EXCLUSIVE MODE");
 
+	/* Complete LOCK [TABLE] <table> IN ACCESS|ROW with rest of lock mode */
+	else if (Matches4("LOCK", MatchAny, "IN", "ACCESS|ROW") ||
+			 Matches5("LOCK", "TABLE", MatchAny, "IN", "ACCESS|ROW"))
+		COMPLETE_WITH_LIST2("EXCLUSIVE MODE", "SHARE MODE");
+
+	/* Complete LOCK [TABLE] <table> IN SHARE with rest of lock mode */
+	else if (Matches4("LOCK", MatchAny, "IN", "SHARE") ||
+			 Matches5("LOCK", "TABLE", MatchAny, "IN", "SHARE"))
+		COMPLETE_WITH_LIST3("MODE", "ROW EXCLUSIVE MODE",
+							"UPDATE EXCLUSIVE MODE");
+
 /* NOTIFY --- can be inside EXPLAIN, RULE, etc */
 	else if (TailMatches1("NOTIFY"))
 		COMPLETE_WITH_QUERY("SELECT pg_catalog.quote_ident(channel) FROM pg_catalog.pg_listening_channels() AS channel WHERE substring(pg_catalog.quote_ident(channel),1,%d)='%s'");
@@ -2725,20 +2812,36 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches1("SHOW"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_show_vars);
 	/* Complete "SET TRANSACTION" */
-	else if (Matches2("SET|BEGIN|START", "TRANSACTION") ||
+	else if (Matches2("SET", "TRANSACTION"))
+		COMPLETE_WITH_LIST5("SNAPSHOT", "ISOLATION LEVEL", "READ", "DEFERRABLE", "NOT DEFERRABLE");
+	else if (Matches2("BEGIN|START", "TRANSACTION") ||
 			 Matches2("BEGIN", "WORK") ||
+			 Matches1("BEGIN") ||
 		  Matches5("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION"))
-		COMPLETE_WITH_LIST2("ISOLATION LEVEL", "READ");
+		COMPLETE_WITH_LIST4("ISOLATION LEVEL", "READ", "DEFERRABLE", "NOT DEFERRABLE");
+	else if (Matches3("SET|BEGIN|START", "TRANSACTION|WORK", "NOT") ||
+			 Matches2("BEGIN", "NOT") ||
+			 Matches6("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "NOT"))
+		COMPLETE_WITH_CONST("DEFERRABLE");
 	else if (Matches3("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION") ||
+			 Matches2("BEGIN", "ISOLATION") ||
 			 Matches6("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "ISOLATION"))
 		COMPLETE_WITH_CONST("LEVEL");
-	else if (Matches4("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION", "LEVEL"))
+	else if (Matches4("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION", "LEVEL") ||
+			 Matches3("BEGIN", "ISOLATION", "LEVEL") ||
+			 Matches7("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "ISOLATION", "LEVEL"))
 		COMPLETE_WITH_LIST3("READ", "REPEATABLE READ", "SERIALIZABLE");
-	else if (Matches5("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION", "LEVEL", "READ"))
+	else if (Matches5("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION", "LEVEL", "READ") ||
+			 Matches4("BEGIN", "ISOLATION", "LEVEL", "READ") ||
+			 Matches8("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "ISOLATION", "LEVEL", "READ"))
 		COMPLETE_WITH_LIST2("UNCOMMITTED", "COMMITTED");
-	else if (Matches5("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION", "LEVEL", "REPEATABLE"))
+	else if (Matches5("SET|BEGIN|START", "TRANSACTION|WORK", "ISOLATION", "LEVEL", "REPEATABLE") ||
+			 Matches4("BEGIN", "ISOLATION", "LEVEL", "REPEATABLE") ||
+			 Matches8("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "ISOLATION", "LEVEL", "REPEATABLE"))
 		COMPLETE_WITH_CONST("READ");
-	else if (Matches3("SET|BEGIN|START", "TRANSACTION|WORK", "READ"))
+	else if (Matches3("SET|BEGIN|START", "TRANSACTION|WORK", "READ") ||
+			 Matches2("BEGIN", "READ") ||
+			 Matches6("SET", "SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "READ"))
 		COMPLETE_WITH_LIST2("ONLY", "WRITE");
 	/* SET CONSTRAINTS */
 	else if (Matches2("SET", "CONSTRAINTS"))
@@ -2931,6 +3034,8 @@ psql_completion(const char *text, int start, int end)
 	}
 	else if (TailMatchesCS1("\\da*"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_aggregates, NULL);
+	else if (TailMatchesCS1("\\dA*"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_access_methods);
 	else if (TailMatchesCS1("\\db*"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_tablespaces);
 	else if (TailMatchesCS1("\\dD*"))
@@ -2994,6 +3099,8 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_QUERY(Query_for_list_of_encodings);
 	else if (TailMatchesCS1("\\h") || TailMatchesCS1("\\help"))
 		COMPLETE_WITH_LIST(sql_commands);
+	else if (TailMatchesCS1("\\l*") && !TailMatchesCS1("\\lo*"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
 	else if (TailMatchesCS1("\\password"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_roles);
 	else if (TailMatchesCS1("\\pset"))
@@ -3001,8 +3108,8 @@ psql_completion(const char *text, int start, int end)
 		static const char *const my_list[] =
 		{"border", "columns", "expanded", "fieldsep", "fieldsep_zero",
 			"footer", "format", "linestyle", "null", "numericlocale",
-			"pager", "recordsep", "recordsep_zero", "tableattr", "title",
-			"tuples_only", "unicode_border_linestyle",
+			"pager", "pager_min_lines", "recordsep", "recordsep_zero",
+			"tableattr", "title", "tuples_only", "unicode_border_linestyle",
 		"unicode_column_linestyle", "unicode_header_linestyle", NULL};
 
 		COMPLETE_WITH_LIST_CS(my_list);
@@ -3215,6 +3322,7 @@ _complete_from_query(int is_schema_query, const char *text, int state)
 	static int	list_index,
 				byte_length;
 	static PGresult *result = NULL;
+
 	/*
 	 * If this is the first time for this completion, we fetch a list of our
 	 * "things" from the backend.
@@ -3231,7 +3339,10 @@ _complete_from_query(int is_schema_query, const char *text, int state)
 		list_index = 0;
 		byte_length = strlen(text);
 
-		/* Count length as number of characters (not bytes), for passing to substring */
+		/*
+		 * Count length as number of characters (not bytes), for passing to
+		 * substring
+		 */
 		while (*pstr)
 		{
 			char_length++;

@@ -55,6 +55,7 @@
 #endif
 
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "portability/instr_time.h"
 #include "postmaster/postmaster.h"
 #include "storage/barrier.h"
@@ -297,9 +298,11 @@ DisownLatch(volatile Latch *latch)
  * we return all of them in one call, but we will return at least one.
  */
 int
-WaitLatch(volatile Latch *latch, int wakeEvents, long timeout)
+WaitLatch(volatile Latch *latch, int wakeEvents, long timeout,
+		  uint32 wait_event_info)
 {
-	return WaitLatchOrSocket(latch, wakeEvents, PGINVALID_SOCKET, timeout);
+	return WaitLatchOrSocket(latch, wakeEvents, PGINVALID_SOCKET, timeout,
+							 wait_event_info);
 }
 
 /*
@@ -316,7 +319,7 @@ WaitLatch(volatile Latch *latch, int wakeEvents, long timeout)
  */
 int
 WaitLatchOrSocket(volatile Latch *latch, int wakeEvents, pgsocket sock,
-				  long timeout)
+				  long timeout, uint32 wait_event_info)
 {
 	int			ret = 0;
 	int			rc;
@@ -344,7 +347,7 @@ WaitLatchOrSocket(volatile Latch *latch, int wakeEvents, pgsocket sock,
 		AddWaitEventToSet(set, ev, sock, NULL, NULL);
 	}
 
-	rc = WaitEventSetWait(set, timeout, &event, 1);
+	rc = WaitEventSetWait(set, timeout, &event, 1, wait_event_info);
 
 	if (rc == 0)
 		ret |= WL_TIMEOUT;
@@ -475,7 +478,7 @@ ResetLatch(volatile Latch *latch)
 /*
  * Create a WaitEventSet with space for nevents different events to wait for.
  *
- * These events can then efficiently waited upon together, using
+ * These events can then be efficiently waited upon together, using
  * WaitEventSetWait().
  */
 WaitEventSet *
@@ -485,35 +488,41 @@ CreateWaitEventSet(MemoryContext context, int nevents)
 	char	   *data;
 	Size		sz = 0;
 
-	sz += sizeof(WaitEventSet);
-	sz += sizeof(WaitEvent) * nevents;
+	/*
+	 * Use MAXALIGN size/alignment to guarantee that later uses of memory are
+	 * aligned correctly. E.g. epoll_event might need 8 byte alignment on some
+	 * platforms, but earlier allocations like WaitEventSet and WaitEvent
+	 * might not sized to guarantee that when purely using sizeof().
+	 */
+	sz += MAXALIGN(sizeof(WaitEventSet));
+	sz += MAXALIGN(sizeof(WaitEvent) * nevents);
 
 #if defined(WAIT_USE_EPOLL)
-	sz += sizeof(struct epoll_event) * nevents;
+	sz += MAXALIGN(sizeof(struct epoll_event) * nevents);
 #elif defined(WAIT_USE_POLL)
-	sz += sizeof(struct pollfd) * nevents;
+	sz += MAXALIGN(sizeof(struct pollfd) * nevents);
 #elif defined(WAIT_USE_WIN32)
 	/* need space for the pgwin32_signal_event */
-	sz += sizeof(HANDLE) * (nevents + 1);
+	sz += MAXALIGN(sizeof(HANDLE) * (nevents + 1));
 #endif
 
 	data = (char *) MemoryContextAllocZero(context, sz);
 
 	set = (WaitEventSet *) data;
-	data += sizeof(WaitEventSet);
+	data += MAXALIGN(sizeof(WaitEventSet));
 
 	set->events = (WaitEvent *) data;
-	data += sizeof(WaitEvent) * nevents;
+	data += MAXALIGN(sizeof(WaitEvent) * nevents);
 
 #if defined(WAIT_USE_EPOLL)
 	set->epoll_ret_events = (struct epoll_event *) data;
-	data += sizeof(struct epoll_event) * nevents;
+	data += MAXALIGN(sizeof(struct epoll_event) * nevents);
 #elif defined(WAIT_USE_POLL)
 	set->pollfds = (struct pollfd *) data;
-	data += sizeof(struct pollfd) * nevents;
+	data += MAXALIGN(sizeof(struct pollfd) * nevents);
 #elif defined(WAIT_USE_WIN32)
 	set->handles = (HANDLE) data;
-	data += sizeof(HANDLE) * nevents;
+	data += MAXALIGN(sizeof(HANDLE) * nevents);
 #endif
 
 	set->latch = NULL;
@@ -616,7 +625,7 @@ AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd, Latch *latch,
 		if (set->latch)
 			elog(ERROR, "cannot wait on more than one latch");
 		if ((events & WL_LATCH_SET) != WL_LATCH_SET)
-			elog(ERROR, "latch events only spuport being set");
+			elog(ERROR, "latch events only support being set");
 	}
 	else
 	{
@@ -857,7 +866,8 @@ WaitEventAdjustWin32(WaitEventSet *set, WaitEvent *event)
  */
 int
 WaitEventSetWait(WaitEventSet *set, long timeout,
-				 WaitEvent *occurred_events, int nevents)
+				 WaitEvent *occurred_events, int nevents,
+				 uint32 wait_event_info)
 {
 	int			returned_events = 0;
 	instr_time	start_time;
@@ -876,6 +886,8 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 		Assert(timeout >= 0 && timeout <= INT_MAX);
 		cur_timeout = timeout;
 	}
+
+	pgstat_report_wait_start(wait_event_info);
 
 #ifndef WIN32
 	waiting = true;
@@ -953,6 +965,8 @@ WaitEventSetWait(WaitEventSet *set, long timeout,
 #ifndef WIN32
 	waiting = false;
 #endif
+
+	pgstat_report_wait_end();
 
 	return returned_events;
 }

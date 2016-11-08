@@ -25,6 +25,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
+#include "optimizer/clauses.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
@@ -38,6 +39,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/sampling.h"
+#include "utils/selfuncs.h"
 
 PG_MODULE_MAGIC;
 
@@ -67,8 +69,6 @@ enum FdwScanPrivateIndex
 	FdwScanPrivateRetrievedAttrs,
 	/* Integer representing the desired fetch_size */
 	FdwScanPrivateFetchSize,
-	/* Oid of user mapping to be used while connecting to the foreign server */
-	FdwScanPrivateUserMappingOid,
 
 	/*
 	 * String describing join i.e. names of relations being joined and types
@@ -345,6 +345,10 @@ static void postgresGetForeignJoinPaths(PlannerInfo *root,
 							JoinPathExtraData *extra);
 static bool postgresRecheckForeignScan(ForeignScanState *node,
 						   TupleTableSlot *slot);
+static void postgresGetForeignUpperPaths(PlannerInfo *root,
+							 UpperRelationKind stage,
+							 RelOptInfo *input_rel,
+							 RelOptInfo *output_rel);
 
 /*
  * Helper functions
@@ -402,11 +406,15 @@ static void conversion_error_callback(void *arg);
 static bool foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel,
 				JoinType jointype, RelOptInfo *outerrel, RelOptInfo *innerrel,
 				JoinPathExtraData *extra);
+static bool foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel);
 static List *get_useful_pathkeys_for_relation(PlannerInfo *root,
 								 RelOptInfo *rel);
 static List *get_useful_ecs_for_relation(PlannerInfo *root, RelOptInfo *rel);
 static void add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 								Path *epq_path);
+static void add_foreign_grouping_paths(PlannerInfo *root,
+						   RelOptInfo *input_rel,
+						   RelOptInfo *grouped_rel);
 
 
 /*
@@ -457,6 +465,9 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 	/* Support functions for join push-down */
 	routine->GetForeignJoinPaths = postgresGetForeignJoinPaths;
 
+	/* Support functions for upper relation push-down */
+	routine->GetForeignUpperPaths = postgresGetForeignUpperPaths;
+
 	PG_RETURN_POINTER(routine);
 }
 
@@ -486,7 +497,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
 	baserel->fdw_private = (void *) fpinfo;
 
-	/* Base foreign tables need to be push down always. */
+	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
 
 	/* Look up foreign-table catalog info. */
@@ -669,6 +680,15 @@ postgresGetForeignRelSize(PlannerInfo *root,
  * we have and want to test whether any of them are useful.  For a foreign
  * table, we don't know what indexes are present on the remote side but
  * want to speculate about which ones we'd like to use if they existed.
+ *
+ * This function returns a list of potentially-useful equivalence classes,
+ * but it does not guarantee that an EquivalenceMember exists which contains
+ * Vars only from the given relation.  For example, given ft1 JOIN t1 ON
+ * ft1.x + t1.x = 0, this function will say that the equivalence class
+ * containing ft1.x + t1.x is potentially useful.  Supposing ft1 is remote and
+ * t1 is local (or on a different server), it will turn out that no useful
+ * ORDER BY clause can be generated.  It's not our job to figure that out
+ * here; we're only interested in identifying relevant ECs.
  */
 static List *
 get_useful_ecs_for_relation(PlannerInfo *root, RelOptInfo *rel)
@@ -721,13 +741,32 @@ get_useful_ecs_for_relation(PlannerInfo *root, RelOptInfo *rel)
 		/*
 		 * restrictinfo->mergeopfamilies != NIL is sufficient to guarantee
 		 * that left_ec and right_ec will be initialized, per comments in
-		 * distribute_qual_to_rels, and rel->joininfo should only contain ECs
-		 * where this relation appears on one side or the other.
+		 * distribute_qual_to_rels.
+		 *
+		 * We want to identify which side of this merge-joinable clause
+		 * contains columns from the relation produced by this RelOptInfo. We
+		 * test for overlap, not containment, because there could be extra
+		 * relations on either side.  For example, suppose we've got something
+		 * like ((A JOIN B ON A.x = B.x) JOIN C ON A.y = C.y) LEFT JOIN D ON
+		 * A.y = D.y.  The input rel might be the joinrel between A and B, and
+		 * we'll consider the join clause A.y = D.y. relids contains a
+		 * relation not involved in the join class (B) and the equivalence
+		 * class for the left-hand side of the clause contains a relation not
+		 * involved in the input rel (C).  Despite the fact that we have only
+		 * overlap and not containment in either direction, A.y is potentially
+		 * useful as a sort column.
+		 *
+		 * Note that it's even possible that relids overlaps neither side of
+		 * the join clause.  For example, consider A LEFT JOIN B ON A.x = B.x
+		 * AND A.x = 1.  The clause A.x = 1 will appear in B's joininfo list,
+		 * but overlaps neither side of B.  In that case, we just skip this
+		 * join clause, since it doesn't suggest a useful sort order for this
+		 * relation.
 		 */
-		if (bms_is_subset(relids, restrictinfo->right_ec->ec_relids))
+		if (bms_overlap(relids, restrictinfo->right_ec->ec_relids))
 			useful_eclass_list = list_append_unique_ptr(useful_eclass_list,
 													 restrictinfo->right_ec);
-		else if (bms_is_subset(relids, restrictinfo->left_ec->ec_relids))
+		else if (bms_overlap(relids, restrictinfo->left_ec->ec_relids))
 			useful_eclass_list = list_append_unique_ptr(useful_eclass_list,
 													  restrictinfo->left_ec);
 	}
@@ -1094,7 +1133,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 		 * rel->baserestrictinfo + parameterization clauses through
 		 * scan_clauses. For a join rel->baserestrictinfo is NIL and we are
 		 * not considering parameterization right now, so there should be no
-		 * scan_clauses for a joinrel.
+		 * scan_clauses for a joinrel and upper rel either.
 		 */
 		Assert(!scan_clauses);
 	}
@@ -1144,7 +1183,8 @@ postgresGetForeignPlan(PlannerInfo *root,
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
 
-	if (foreignrel->reloptkind == RELOPT_JOINREL)
+	if (foreignrel->reloptkind == RELOPT_JOINREL ||
+		foreignrel->reloptkind == RELOPT_UPPER_REL)
 	{
 		/* For a join relation, get the conditions from fdw_private structure */
 		remote_conds = fpinfo->remote_conds;
@@ -1164,6 +1204,13 @@ postgresGetForeignPlan(PlannerInfo *root,
 		if (outer_plan)
 		{
 			ListCell   *lc;
+
+			/*
+			 * Right now, we only consider grouping and aggregation beyond
+			 * joins. Queries involving aggregates or grouping do not require
+			 * EPQ mechanism, hence should not have an outer plan here.
+			 */
+			Assert(foreignrel->reloptkind != RELOPT_UPPER_REL);
 
 			outer_plan->targetlist = fdw_scan_tlist;
 
@@ -1198,12 +1245,12 @@ postgresGetForeignPlan(PlannerInfo *root,
 	 * Build the fdw_private list that will be available to the executor.
 	 * Items in the list must match order in enum FdwScanPrivateIndex.
 	 */
-	fdw_private = list_make5(makeString(sql.data),
+	fdw_private = list_make4(makeString(sql.data),
 							 remote_conds,
 							 retrieved_attrs,
-							 makeInteger(fpinfo->fetch_size),
-							 makeInteger(foreignrel->umid));
-	if (foreignrel->reloptkind == RELOPT_JOINREL)
+							 makeInteger(fpinfo->fetch_size));
+	if (foreignrel->reloptkind == RELOPT_JOINREL ||
+		foreignrel->reloptkind == RELOPT_UPPER_REL)
 		fdw_private = lappend(fdw_private,
 							  makeString(fpinfo->relation_name->data));
 
@@ -1234,7 +1281,11 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	EState	   *estate = node->ss.ps.state;
 	PgFdwScanState *fsstate;
+	RangeTblEntry *rte;
+	Oid			userid;
+	ForeignTable *table;
 	UserMapping *user;
+	int			rtindex;
 	int			numParams;
 
 	/*
@@ -1250,36 +1301,21 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	node->fdw_state = (void *) fsstate;
 
 	/*
-	 * Obtain the foreign server where to connect and user mapping to use for
-	 * connection. For base relations we obtain this information from
-	 * catalogs. For join relations, this information is frozen at the time of
-	 * planning to ensure that the join is safe to pushdown. In case the
-	 * information goes stale between planning and execution, plan will be
-	 * invalidated and replanned.
+	 * Identify which user to do the remote access as.  This should match what
+	 * ExecCheckRTEPerms() does.  In case of a join or aggregate, use the
+	 * lowest-numbered member RTE as a representative; we would get the same
+	 * result from any.
 	 */
 	if (fsplan->scan.scanrelid > 0)
-	{
-		ForeignTable *table;
-
-		/*
-		 * Identify which user to do the remote access as.  This should match
-		 * what ExecCheckRTEPerms() does.
-		 */
-		RangeTblEntry *rte = rt_fetch(fsplan->scan.scanrelid, estate->es_range_table);
-		Oid			userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
-
-		fsstate->rel = node->ss.ss_currentRelation;
-		table = GetForeignTable(RelationGetRelid(fsstate->rel));
-
-		user = GetUserMapping(userid, table->serverid);
-	}
+		rtindex = fsplan->scan.scanrelid;
 	else
-	{
-		Oid			umid = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateUserMappingOid));
+		rtindex = bms_next_member(fsplan->fs_relids, -1);
+	rte = rt_fetch(rtindex, estate->es_range_table);
+	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
 
-		user = GetUserMappingById(umid);
-		Assert(fsplan->fs_server == user->serverid);
-	}
+	/* Get info about foreign table. */
+	table = GetForeignTable(rte->relid);
+	user = GetUserMapping(userid, table->serverid);
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -1302,23 +1338,25 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Create contexts for batches of tuples and per-tuple temp workspace. */
 	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											   "postgres_fdw tuple data",
-											   ALLOCSET_DEFAULT_MINSIZE,
-											   ALLOCSET_DEFAULT_INITSIZE,
-											   ALLOCSET_DEFAULT_MAXSIZE);
+											   ALLOCSET_DEFAULT_SIZES);
 	fsstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											  "postgres_fdw temporary data",
-											  ALLOCSET_SMALL_MINSIZE,
-											  ALLOCSET_SMALL_INITSIZE,
-											  ALLOCSET_SMALL_MAXSIZE);
+											  ALLOCSET_SMALL_SIZES);
 
 	/*
 	 * Get info we'll need for converting data fetched from the foreign server
 	 * into local representation and error reporting during that process.
 	 */
 	if (fsplan->scan.scanrelid > 0)
+	{
+		fsstate->rel = node->ss.ss_currentRelation;
 		fsstate->tupdesc = RelationGetDescr(fsstate->rel);
+	}
 	else
+	{
+		fsstate->rel = NULL;
 		fsstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	}
 
 	fsstate->attinmeta = TupleDescGetAttInMetadata(fsstate->tupdesc);
 
@@ -1676,9 +1714,7 @@ postgresBeginForeignModify(ModifyTableState *mtstate,
 	/* Create context for per-tuple temp workspace. */
 	fmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											  "postgres_fdw temporary data",
-											  ALLOCSET_SMALL_MINSIZE,
-											  ALLOCSET_SMALL_INITSIZE,
-											  ALLOCSET_SMALL_MAXSIZE);
+											  ALLOCSET_SMALL_SIZES);
 
 	/* Prepare for input conversion of RETURNING results. */
 	if (fmstate->has_returning)
@@ -2275,9 +2311,7 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 	/* Create context for per-tuple temp workspace. */
 	dmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											  "postgres_fdw temporary data",
-											  ALLOCSET_SMALL_MINSIZE,
-											  ALLOCSET_SMALL_INITSIZE,
-											  ALLOCSET_SMALL_MAXSIZE);
+											  ALLOCSET_SMALL_SIZES);
 
 	/* Prepare for input conversion of RETURNING results. */
 	if (dmstate->has_returning)
@@ -2441,7 +2475,8 @@ postgresExplainDirectModify(ForeignScanState *node, ExplainState *es)
 /*
  * estimate_path_cost_size
  *		Get cost and size estimates for a foreign scan on given foreign relation
- *		either a base relation or a join between foreign relations.
+ *		either a base relation or a join between foreign relations or an upper
+ *		relation containing foreign relations.
  *
  * param_join_conds are the parameterization clauses with outer relations.
  * pathkeys specify the expected sort order if any for given path being costed.
@@ -2494,7 +2529,8 @@ estimate_path_cost_size(PlannerInfo *root,
 						   &remote_param_join_conds, &local_param_join_conds);
 
 		/* Build the list of columns to be fetched from the foreign server. */
-		if (foreignrel->reloptkind == RELOPT_JOINREL)
+		if (foreignrel->reloptkind == RELOPT_JOINREL ||
+			foreignrel->reloptkind == RELOPT_UPPER_REL)
 			fdw_scan_tlist = build_tlist_to_deparse(foreignrel);
 		else
 			fdw_scan_tlist = NIL;
@@ -2575,25 +2611,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			startup_cost = fpinfo->rel_startup_cost;
 			run_cost = fpinfo->rel_total_cost - fpinfo->rel_startup_cost;
 		}
-		else if (foreignrel->reloptkind != RELOPT_JOINREL)
-		{
-			/* Clamp retrieved rows estimates to at most foreignrel->tuples. */
-			retrieved_rows = Min(retrieved_rows, foreignrel->tuples);
-
-			/*
-			 * Cost as though this were a seqscan, which is pessimistic.  We
-			 * effectively imagine the local_conds are being evaluated
-			 * remotely, too.
-			 */
-			startup_cost = 0;
-			run_cost = 0;
-			run_cost += seq_page_cost * foreignrel->pages;
-
-			startup_cost += foreignrel->baserestrictcost.startup;
-			cpu_per_tuple = cpu_tuple_cost + foreignrel->baserestrictcost.per_tuple;
-			run_cost += cpu_per_tuple * foreignrel->tuples;
-		}
-		else
+		else if (foreignrel->reloptkind == RELOPT_JOINREL)
 		{
 			PgFdwRelationInfo *fpinfo_i;
 			PgFdwRelationInfo *fpinfo_o;
@@ -2618,7 +2636,9 @@ estimate_path_cost_size(PlannerInfo *root,
 			 * rows.
 			 */
 
-			/* Calculate the cost of clauses pushed down the foreign server */
+			/*
+			 * Calculate the cost of clauses pushed down to the foreign server
+			 */
 			cost_qual_eval(&remote_conds_cost, fpinfo->remote_conds, root);
 			/* Calculate the cost of applying join clauses */
 			cost_qual_eval(&join_cost, fpinfo->joinclauses, root);
@@ -2656,6 +2676,99 @@ estimate_path_cost_size(PlannerInfo *root,
 			nrows = clamp_row_est(nrows * fpinfo->joinclause_sel);
 			run_cost += nrows * remote_conds_cost.per_tuple;
 			run_cost += fpinfo->local_conds_cost.per_tuple * retrieved_rows;
+		}
+		else if (foreignrel->reloptkind == RELOPT_UPPER_REL)
+		{
+			PgFdwRelationInfo *ofpinfo;
+			PathTarget *ptarget = root->upper_targets[UPPERREL_GROUP_AGG];
+			AggClauseCosts aggcosts;
+			double		input_rows;
+			int			numGroupCols;
+			double		numGroups = 1;
+
+			/*
+			 * This cost model is mixture of costing done for sorted and
+			 * hashed aggregates in cost_agg().  We are not sure which
+			 * strategy will be considered at remote side, thus for
+			 * simplicity, we put all startup related costs in startup_cost
+			 * and all finalization and run cost are added in total_cost.
+			 *
+			 * Also, core does not care about costing HAVING expressions and
+			 * adding that to the costs.  So similarly, here too we are not
+			 * considering remote and local conditions for costing.
+			 */
+
+			ofpinfo = (PgFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+
+			/* Get rows and width from input rel */
+			input_rows = ofpinfo->rows;
+			width = ofpinfo->width;
+
+			/* Collect statistics about aggregates for estimating costs. */
+			MemSet(&aggcosts, 0, sizeof(AggClauseCosts));
+			if (root->parse->hasAggs)
+			{
+				get_agg_clause_costs(root, (Node *) fpinfo->grouped_tlist,
+									 AGGSPLIT_SIMPLE, &aggcosts);
+				get_agg_clause_costs(root, (Node *) root->parse->havingQual,
+									 AGGSPLIT_SIMPLE, &aggcosts);
+			}
+
+			/* Get number of grouping columns and possible number of groups */
+			numGroupCols = list_length(root->parse->groupClause);
+			numGroups = estimate_num_groups(root,
+							get_sortgrouplist_exprs(root->parse->groupClause,
+													fpinfo->grouped_tlist),
+											input_rows, NULL);
+
+			/*
+			 * Number of rows expected from foreign server will be same as
+			 * that of number of groups.
+			 */
+			rows = retrieved_rows = numGroups;
+
+			/*-----
+			 * Startup cost includes:
+			 *	  1. Startup cost for underneath input * relation
+			 *	  2. Cost of performing aggregation, per cost_agg()
+			 *	  3. Startup cost for PathTarget eval
+			 *-----
+			 */
+			startup_cost = ofpinfo->rel_startup_cost;
+			startup_cost += aggcosts.transCost.startup;
+			startup_cost += aggcosts.transCost.per_tuple * input_rows;
+			startup_cost += (cpu_operator_cost * numGroupCols) * input_rows;
+			startup_cost += ptarget->cost.startup;
+
+			/*-----
+			 * Run time cost includes:
+			 *	  1. Run time cost of underneath input relation
+			 *	  2. Run time cost of performing aggregation, per cost_agg()
+			 *	  3. PathTarget eval cost for each output row
+			 *-----
+			 */
+			run_cost = ofpinfo->rel_total_cost - ofpinfo->rel_startup_cost;
+			run_cost += aggcosts.finalCost * numGroups;
+			run_cost += cpu_tuple_cost * numGroups;
+			run_cost += ptarget->cost.per_tuple * numGroups;
+		}
+		else
+		{
+			/* Clamp retrieved rows estimates to at most foreignrel->tuples. */
+			retrieved_rows = Min(retrieved_rows, foreignrel->tuples);
+
+			/*
+			 * Cost as though this were a seqscan, which is pessimistic.  We
+			 * effectively imagine the local_conds are being evaluated
+			 * remotely, too.
+			 */
+			startup_cost = 0;
+			run_cost = 0;
+			run_cost += seq_page_cost * foreignrel->pages;
+
+			startup_cost += foreignrel->baserestrictcost.startup;
+			cpu_per_tuple = cpu_tuple_cost + foreignrel->baserestrictcost.per_tuple;
+			run_cost += cpu_per_tuple * foreignrel->tuples;
 		}
 
 		/*
@@ -3460,9 +3573,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	astate.anl_cxt = CurrentMemoryContext;
 	astate.temp_cxt = AllocSetContextCreate(CurrentMemoryContext,
 											"postgres_fdw temporary data",
-											ALLOCSET_SMALL_MINSIZE,
-											ALLOCSET_SMALL_INITSIZE,
-											ALLOCSET_SMALL_MAXSIZE);
+											ALLOCSET_SMALL_SIZES);
 
 	/*
 	 * Get the connection to use.  We do the remote access as the table's
@@ -3924,14 +4035,6 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
  * Assess whether the join between inner and outer relations can be pushed down
  * to the foreign server. As a side effect, save information we obtain in this
  * function to PgFdwRelationInfo passed in.
- *
- * Joins that satisfy conditions below are safe to push down.
- *
- * 1) Join type is INNER or OUTER (one of LEFT/RIGHT/FULL)
- * 2) Both outer and inner portions are safe to push-down
- * 3) All join conditions are safe to push down
- * 4) No relation has local filter (this can be relaxed for INNER JOIN, if we
- *	  can move unpushable clauses upwards in the join tree).
  */
 static bool
 foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
@@ -3944,16 +4047,6 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	ListCell   *lc;
 	List	   *joinclauses;
 	List	   *otherclauses;
-
-	/*
-	 * Core code may call GetForeignJoinPaths hook even when the join relation
-	 * doesn't have a valid user mapping associated with it. See
-	 * build_join_rel() for details. We can't push down such join, since there
-	 * doesn't exist a user mapping which can be used to connect to the
-	 * foreign server.
-	 */
-	if (!OidIsValid(joinrel->umid))
-		return false;
 
 	/*
 	 * We support pushing down INNER, LEFT, RIGHT and FULL OUTER joins.
@@ -4008,6 +4101,26 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			return false;
 	}
 
+	/*
+	 * deparseExplicitTargetList() isn't smart enough to handle anything other
+	 * than a Var.  In particular, if there's some PlaceHolderVar that would
+	 * need to be evaluated within this join tree (because there's an upper
+	 * reference to a quantity that may go to NULL as a result of an outer
+	 * join), then we can't try to push the join down because we'll fail when
+	 * we get to deparseExplicitTargetList().  However, a PlaceHolderVar that
+	 * needs to be evaluated *at the top* of this join tree is OK, because we
+	 * can do that locally after fetching the results from the remote side.
+	 */
+	foreach(lc, root->placeholder_list)
+	{
+		PlaceHolderInfo *phinfo = lfirst(lc);
+		Relids		relids = joinrel->relids;
+
+		if (bms_is_subset(phinfo->ph_eval_at, relids) &&
+			bms_nonempty_difference(relids, phinfo->ph_eval_at))
+			return false;
+	}
+
 	/* Save the join clauses, for later use. */
 	fpinfo->joinclauses = joinclauses;
 
@@ -4035,19 +4148,20 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 
 	/*
 	 * Pull the other remote conditions from the joining relations into join
-	 * clauses or other remote clauses (remote_conds) of this relation wherever
-	 * possible. This avoids building subqueries at every join step, which is
-	 * not currently supported by the deparser logic.
+	 * clauses or other remote clauses (remote_conds) of this relation
+	 * wherever possible. This avoids building subqueries at every join step,
+	 * which is not currently supported by the deparser logic.
 	 *
 	 * For an inner join, clauses from both the relations are added to the
-	 * other remote clauses. For LEFT and RIGHT OUTER join, the clauses from the
-	 * outer side are added to remote_conds since those can be evaluated after
-	 * the join is evaluated. The clauses from inner side are added to the
-	 * joinclauses, since they need to evaluated while constructing the join.
+	 * other remote clauses. For LEFT and RIGHT OUTER join, the clauses from
+	 * the outer side are added to remote_conds since those can be evaluated
+	 * after the join is evaluated. The clauses from inner side are added to
+	 * the joinclauses, since they need to be evaluated while constructing the
+	 * join.
 	 *
-	 * For a FULL OUTER JOIN, the other clauses from either relation can not be
-	 * added to the joinclauses or remote_conds, since each relation acts as an
-	 * outer relation for the other. Consider such full outer join as
+	 * For a FULL OUTER JOIN, the other clauses from either relation can not
+	 * be added to the joinclauses or remote_conds, since each relation acts
+	 * as an outer relation for the other. Consider such full outer join as
 	 * unshippable because of the reasons mentioned above in this comment.
 	 *
 	 * The joining sides can not have local conditions, thus no need to test
@@ -4087,9 +4201,9 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	}
 
 	/*
-	 * For an inner join, as explained above all restrictions can be treated
-	 * alike. Treating the pushed down conditions as join conditions allows a
-	 * top level full outer join to be deparsed without requiring subqueries.
+	 * For an inner join, all restrictions can be treated alike. Treating the
+	 * pushed down conditions as join conditions allows a top level full outer
+	 * join to be deparsed without requiring subqueries.
 	 */
 	if (jointype == JOIN_INNER)
 	{
@@ -4109,6 +4223,20 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 */
 	fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate ||
 		fpinfo_i->use_remote_estimate;
+
+	/* Get user mapping */
+	if (fpinfo->use_remote_estimate)
+	{
+		if (fpinfo_o->use_remote_estimate)
+			fpinfo->user = fpinfo_o->user;
+		else
+			fpinfo->user = fpinfo_i->user;
+	}
+	else
+		fpinfo->user = NULL;
+
+	/* Get foreign server */
+	fpinfo->server = fpinfo_o->server;
 
 	/*
 	 * Since both the joining relations come from the same server, the server
@@ -4223,16 +4351,15 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	fpinfo->attrs_used = NULL;
 
 	/*
-	 * In case there is a possibility that EvalPlanQual will be executed, we
-	 * should be able to reconstruct the row, from base relations applying all
-	 * the conditions. We create a local plan from a suitable local path
-	 * available in the path list. In case such a path doesn't exist, we can
-	 * not push the join to the foreign server since we won't be able to
+	 * If there is a possibility that EvalPlanQual will be executed, we need
+	 * to be able to reconstruct the row using scans of the base relations.
+	 * GetExistingLocalJoinPath will find a suitable path for this purpose in
+	 * the path list of the joinrel, if one exists.  We must be careful to
+	 * call it before adding any ForeignPath, since the ForeignPath might
+	 * dominate the only suitable local path available.  We also do it before
 	 * reconstruct the row for EvalPlanQual(). Find an alternative local path
-	 * before we add ForeignPath, lest the new path would kick possibly the
-	 * only local path. Do this before calling foreign_join_ok(), since that
-	 * function updates fpinfo and marks it as pushable if the join is found
-	 * to be pushable.
+	 * calling foreign_join_ok(), since that function updates fpinfo and marks
+	 * it as pushable if the join is found to be pushable.
 	 */
 	if (root->parse->commandType == CMD_DELETE ||
 		root->parse->commandType == CMD_UPDATE ||
@@ -4272,25 +4399,13 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	cost_qual_eval(&fpinfo->local_conds_cost, fpinfo->local_conds, root);
 
 	/*
-	 * If we are going to estimate the costs using EXPLAIN, we will need
-	 * connection information. Fill it here.
+	 * If we are going to estimate costs locally, estimate the join clause
+	 * selectivity here while we have special join info.
 	 */
-	if (fpinfo->use_remote_estimate)
-		fpinfo->user = GetUserMappingById(joinrel->umid);
-	else
-	{
-		fpinfo->user = NULL;
-
-		/*
-		 * If we are going to estimate costs locally, estimate the join clause
-		 * selectivity here while we have special join info.
-		 */
+	if (!fpinfo->use_remote_estimate)
 		fpinfo->joinclause_sel = clauselist_selectivity(root, fpinfo->joinclauses,
 														0, fpinfo->jointype,
 														extra->sjinfo);
-
-	}
-	fpinfo->server = GetForeignServer(joinrel->serverid);
 
 	/* Estimate costs for bare join relation */
 	estimate_path_cost_size(root, joinrel, NIL, NIL, &rows,
@@ -4316,7 +4431,7 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 									   NIL,		/* no pathkeys */
 									   NULL,	/* no required_outer */
 									   epq_path,
-									   NULL);	/* no fdw_private */
+									   NIL);	/* no fdw_private */
 
 	/* Add generated path into joinrel by add_path(). */
 	add_path(joinrel, (Path *) joinpath);
@@ -4325,6 +4440,318 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
 
 	/* XXX Consider parameterized paths for the join relation */
+}
+
+/*
+ * Assess whether the aggregation, grouping and having operations can be pushed
+ * down to the foreign server.  As a side effect, save information we obtain in
+ * this function to PgFdwRelationInfo of the input relation.
+ */
+static bool
+foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel)
+{
+	Query	   *query = root->parse;
+	PathTarget *grouping_target;
+	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) grouped_rel->fdw_private;
+	PgFdwRelationInfo *ofpinfo;
+	List	   *aggvars;
+	ListCell   *lc;
+	int			i;
+	List	   *tlist = NIL;
+
+	/* Grouping Sets are not pushable */
+	if (query->groupingSets)
+		return false;
+
+	/* Get the fpinfo of the underlying scan relation. */
+	ofpinfo = (PgFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+
+	/*
+	 * If underneath input relation has any local conditions, those conditions
+	 * are required to be applied before performing aggregation.  Hence the
+	 * aggregate cannot be pushed down.
+	 */
+	if (ofpinfo->local_conds)
+		return false;
+
+	/*
+	 * The targetlist expected from this node and the targetlist pushed down
+	 * to the foreign server may be different. The latter requires
+	 * sortgrouprefs to be set to push down GROUP BY clause, but should not
+	 * have those arising from ORDER BY clause. These sortgrouprefs may be
+	 * different from those in the plan's targetlist. Use a copy of path
+	 * target to record the new sortgrouprefs.
+	 */
+	grouping_target = copy_pathtarget(root->upper_targets[UPPERREL_GROUP_AGG]);
+
+	/*
+	 * Evaluate grouping targets and check whether they are safe to push down
+	 * to the foreign side.  All GROUP BY expressions will be part of the
+	 * grouping target and thus there is no need to evaluate it separately.
+	 * While doing so, add required expressions into target list which can
+	 * then be used to pass to foreign server.
+	 */
+	i = 0;
+	foreach(lc, grouping_target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(grouping_target, i);
+		ListCell   *l;
+
+		/* Check whether this expression is part of GROUP BY clause */
+		if (sgref && get_sortgroupref_clause_noerr(sgref, query->groupClause))
+		{
+			/*
+			 * If any of the GROUP BY expression is not shippable we can not
+			 * push down aggregation to the foreign server.
+			 */
+			if (!is_foreign_expr(root, grouped_rel, expr))
+				return false;
+
+			/* Pushable, add to tlist */
+			tlist = add_to_flat_tlist(tlist, list_make1(expr));
+		}
+		else
+		{
+			/* Check entire expression whether it is pushable or not */
+			if (is_foreign_expr(root, grouped_rel, expr))
+			{
+				/* Pushable, add to tlist */
+				tlist = add_to_flat_tlist(tlist, list_make1(expr));
+			}
+			else
+			{
+				/*
+				 * If we have sortgroupref set, then it means that we have an
+				 * ORDER BY entry pointing to this expression.  Since we are
+				 * not pushing ORDER BY with GROUP BY, clear it.
+				 */
+				if (sgref)
+					grouping_target->sortgrouprefs[i] = 0;
+
+				/* Not matched exactly, pull the var with aggregates then */
+				aggvars = pull_var_clause((Node *) expr,
+										  PVC_INCLUDE_AGGREGATES);
+
+				if (!is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
+					return false;
+
+				/*
+				 * Add aggregates, if any, into the targetlist.  Plain var
+				 * nodes should be either same as some GROUP BY expression or
+				 * part of some GROUP BY expression. In later case, the query
+				 * cannot refer plain var nodes without the surrounding
+				 * expression.  In both the cases, they are already part of
+				 * the targetlist and thus no need to add them again.  In fact
+				 * adding pulled plain var nodes in SELECT clause will cause
+				 * an error on the foreign server if they are not same as some
+				 * GROUP BY expression.
+				 */
+				foreach(l, aggvars)
+				{
+					Expr	   *expr = (Expr *) lfirst(l);
+
+					if (IsA(expr, Aggref))
+						tlist = add_to_flat_tlist(tlist, list_make1(expr));
+				}
+			}
+		}
+
+		i++;
+	}
+
+	/*
+	 * Classify the pushable and non-pushable having clauses and save them in
+	 * remote_conds and local_conds of the grouped rel's fpinfo.
+	 */
+	if (root->hasHavingQual && query->havingQual)
+	{
+		ListCell   *lc;
+
+		foreach(lc, (List *) query->havingQual)
+		{
+			Expr	   *expr = (Expr *) lfirst(lc);
+
+			if (!is_foreign_expr(root, grouped_rel, expr))
+				fpinfo->local_conds = lappend(fpinfo->local_conds, expr);
+			else
+				fpinfo->remote_conds = lappend(fpinfo->remote_conds, expr);
+		}
+	}
+
+	/*
+	 * If there are any local conditions, pull Vars and aggregates from it and
+	 * check whether they are safe to pushdown or not.
+	 */
+	if (fpinfo->local_conds)
+	{
+		ListCell   *lc;
+		List	   *aggvars = pull_var_clause((Node *) fpinfo->local_conds,
+											  PVC_INCLUDE_AGGREGATES);
+
+		foreach(lc, aggvars)
+		{
+			Expr	   *expr = (Expr *) lfirst(lc);
+
+			/*
+			 * If aggregates within local conditions are not safe to push
+			 * down, then we cannot push down the query.  Vars are already
+			 * part of GROUP BY clause which are checked above, so no need to
+			 * access them again here.
+			 */
+			if (IsA(expr, Aggref))
+			{
+				if (!is_foreign_expr(root, grouped_rel, expr))
+					return false;
+
+				tlist = add_to_flat_tlist(tlist, aggvars);
+			}
+		}
+	}
+
+	/* Transfer any sortgroupref data to the replacement tlist */
+	apply_pathtarget_labeling_to_tlist(tlist, grouping_target);
+
+	/* Store generated targetlist */
+	fpinfo->grouped_tlist = tlist;
+
+	/* Safe to pushdown */
+	fpinfo->pushdown_safe = true;
+
+	/*
+	 * If user is willing to estimate cost for a scan using EXPLAIN, he
+	 * intends to estimate scans on that relation more accurately. Then, it
+	 * makes sense to estimate the cost of the grouping on that relation more
+	 * accurately using EXPLAIN.
+	 */
+	fpinfo->use_remote_estimate = ofpinfo->use_remote_estimate;
+
+	/* Copy startup and tuple cost as is from underneath input rel's fpinfo */
+	fpinfo->fdw_startup_cost = ofpinfo->fdw_startup_cost;
+	fpinfo->fdw_tuple_cost = ofpinfo->fdw_tuple_cost;
+
+	/*
+	 * Set cached relation costs to some negative value, so that we can detect
+	 * when they are set to some sensible costs, during one (usually the
+	 * first) of the calls to estimate_path_cost_size().
+	 */
+	fpinfo->rel_startup_cost = -1;
+	fpinfo->rel_total_cost = -1;
+
+	/* Set fetch size same as that of underneath input rel's fpinfo */
+	fpinfo->fetch_size = ofpinfo->fetch_size;
+
+	/*
+	 * Set the string describing this grouped relation to be used in EXPLAIN
+	 * output of corresponding ForeignScan.
+	 */
+	fpinfo->relation_name = makeStringInfo();
+	appendStringInfo(fpinfo->relation_name, "Aggregate on (%s)",
+					 ofpinfo->relation_name->data);
+
+	return true;
+}
+
+/*
+ * postgresGetForeignUpperPaths
+ *		Add paths for post-join operations like aggregation, grouping etc. if
+ *		corresponding operations are safe to push down.
+ *
+ * Right now, we only support aggregate, grouping and having clause pushdown.
+ */
+static void
+postgresGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+							 RelOptInfo *input_rel, RelOptInfo *output_rel)
+{
+	PgFdwRelationInfo *fpinfo;
+
+	/*
+	 * If input rel is not safe to pushdown, then simply return as we cannot
+	 * perform any post-join operations on the foreign server.
+	 */
+	if (!input_rel->fdw_private ||
+		!((PgFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe)
+		return;
+
+	/* Ignore stages we don't support; and skip any duplicate calls. */
+	if (stage != UPPERREL_GROUP_AGG || output_rel->fdw_private)
+		return;
+
+	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
+	fpinfo->pushdown_safe = false;
+	output_rel->fdw_private = fpinfo;
+
+	add_foreign_grouping_paths(root, input_rel, output_rel);
+}
+
+/*
+ * add_foreign_grouping_paths
+ *		Add foreign path for grouping and/or aggregation.
+ *
+ * Given input_rel represents the underlying scan.  The paths are added to the
+ * given grouped_rel.
+ */
+static void
+add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+						   RelOptInfo *grouped_rel)
+{
+	Query	   *parse = root->parse;
+	PgFdwRelationInfo *ifpinfo = input_rel->fdw_private;
+	PgFdwRelationInfo *fpinfo = grouped_rel->fdw_private;
+	ForeignPath *grouppath;
+	PathTarget *grouping_target;
+	double		rows;
+	int			width;
+	Cost		startup_cost;
+	Cost		total_cost;
+
+	/* Nothing to be done, if there is no grouping or aggregation required. */
+	if (!parse->groupClause && !parse->groupingSets && !parse->hasAggs &&
+		!root->hasHavingQual)
+		return;
+
+	grouping_target = root->upper_targets[UPPERREL_GROUP_AGG];
+
+	/* save the input_rel as outerrel in fpinfo */
+	fpinfo->outerrel = input_rel;
+
+	/*
+	 * Copy foreign table, foreign server, user mapping, shippable extensions
+	 * etc. details from the input relation's fpinfo.
+	 */
+	fpinfo->table = ifpinfo->table;
+	fpinfo->server = ifpinfo->server;
+	fpinfo->user = ifpinfo->user;
+	fpinfo->shippable_extensions = ifpinfo->shippable_extensions;
+
+	/* Assess if it is safe to push down aggregation and grouping. */
+	if (!foreign_grouping_ok(root, grouped_rel))
+		return;
+
+	/* Estimate the cost of push down */
+	estimate_path_cost_size(root, grouped_rel, NIL, NIL, &rows,
+							&width, &startup_cost, &total_cost);
+
+	/* Now update this information in the fpinfo */
+	fpinfo->rows = rows;
+	fpinfo->width = width;
+	fpinfo->startup_cost = startup_cost;
+	fpinfo->total_cost = total_cost;
+
+	/* Create and add foreign path to the grouping relation. */
+	grouppath = create_foreignscan_path(root,
+										grouped_rel,
+										grouping_target,
+										rows,
+										startup_cost,
+										total_cost,
+										NIL,	/* no pathkeys */
+										NULL,	/* no required_outer */
+										NULL,
+										NIL);	/* no fdw_private */
+
+	/* Add generated path into grouped_rel by add_path(). */
+	add_path(grouped_rel, (Path *) grouppath);
 }
 
 /*
@@ -4349,6 +4776,7 @@ make_tuple_from_result_row(PGresult *res,
 	Datum	   *values;
 	bool	   *nulls;
 	ItemPointer ctid = NULL;
+	Oid			oid = InvalidOid;
 	ConversionLocation errpos;
 	ErrorContextCallback errcallback;
 	MemoryContext oldcontext;
@@ -4406,7 +4834,11 @@ make_tuple_from_result_row(PGresult *res,
 		else
 			valstr = PQgetvalue(res, row, j);
 
-		/* convert value to internal representation */
+		/*
+		 * convert value to internal representation
+		 *
+		 * Note: we ignore system columns other than ctid and oid in result
+		 */
 		errpos.cur_attno = i;
 		if (i > 0)
 		{
@@ -4421,13 +4853,24 @@ make_tuple_from_result_row(PGresult *res,
 		}
 		else if (i == SelfItemPointerAttributeNumber)
 		{
-			/* ctid --- note we ignore any other system column in result */
+			/* ctid */
 			if (valstr != NULL)
 			{
 				Datum		datum;
 
 				datum = DirectFunctionCall1(tidin, CStringGetDatum(valstr));
 				ctid = (ItemPointer) DatumGetPointer(datum);
+			}
+		}
+		else if (i == ObjectIdAttributeNumber)
+		{
+			/* oid */
+			if (valstr != NULL)
+			{
+				Datum		datum;
+
+				datum = DirectFunctionCall1(oidin, CStringGetDatum(valstr));
+				oid = DatumGetObjectId(datum);
 			}
 		}
 		errpos.cur_attno = 0;
@@ -4473,6 +4916,12 @@ make_tuple_from_result_row(PGresult *res,
 	HeapTupleHeaderSetXmin(tuple->t_data, InvalidTransactionId);
 	HeapTupleHeaderSetCmin(tuple->t_data, InvalidTransactionId);
 
+	/*
+	 * If we have an OID to return, install it.
+	 */
+	if (OidIsValid(oid))
+		HeapTupleSetOid(tuple, oid);
+
 	/* Clean up */
 	MemoryContextReset(temp_context);
 
@@ -4488,6 +4937,7 @@ conversion_error_callback(void *arg)
 {
 	const char *attname = NULL;
 	const char *relname = NULL;
+	bool		is_wholerow = false;
 	ConversionLocation *errpos = (ConversionLocation *) arg;
 
 	if (errpos->rel)
@@ -4499,6 +4949,8 @@ conversion_error_callback(void *arg)
 			attname = NameStr(tupdesc->attrs[errpos->cur_attno - 1]->attname);
 		else if (errpos->cur_attno == SelfItemPointerAttributeNumber)
 			attname = "ctid";
+		else if (errpos->cur_attno == ObjectIdAttributeNumber)
+			attname = "oid";
 
 		relname = RelationGetRelationName(errpos->rel);
 	}
@@ -4509,23 +4961,43 @@ conversion_error_callback(void *arg)
 		ForeignScan *fsplan = (ForeignScan *) fsstate->ss.ps.plan;
 		EState	   *estate = fsstate->ss.ps.state;
 		TargetEntry *tle;
-		Var		   *var;
-		RangeTblEntry *rte;
 
 		Assert(IsA(fsplan, ForeignScan));
 		tle = (TargetEntry *) list_nth(fsplan->fdw_scan_tlist,
 									   errpos->cur_attno - 1);
 		Assert(IsA(tle, TargetEntry));
-		var = (Var *) tle->expr;
-		Assert(IsA(var, Var));
 
-		rte = rt_fetch(var->varno, estate->es_range_table);
-		relname = get_rel_name(rte->relid);
-		attname = get_relid_attribute_name(rte->relid, var->varattno);
+		/*
+		 * Target list can have Vars and expressions.  For Vars, we can get
+		 * it's relation, however for expressions we can't.  Thus for
+		 * expressions, just show generic context message.
+		 */
+		if (IsA(tle->expr, Var))
+		{
+			RangeTblEntry *rte;
+			Var		   *var = (Var *) tle->expr;
+
+			rte = rt_fetch(var->varno, estate->es_range_table);
+
+			if (var->varattno == 0)
+				is_wholerow = true;
+			else
+				attname = get_relid_attribute_name(rte->relid, var->varattno);
+
+			relname = get_rel_name(rte->relid);
+		}
+		else
+			errcontext("processing expression at position %d in select list",
+					   errpos->cur_attno);
 	}
 
-	if (attname && relname)
-		errcontext("column \"%s\" of foreign table \"%s\"", attname, relname);
+	if (relname)
+	{
+		if (is_wholerow)
+			errcontext("whole-row reference to foreign table \"%s\"", relname);
+		else if (attname)
+			errcontext("column \"%s\" of foreign table \"%s\"", attname, relname);
+	}
 }
 
 /*

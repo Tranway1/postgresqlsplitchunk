@@ -32,6 +32,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -92,7 +93,7 @@ typedef struct CommitTimestampShared
 {
 	TransactionId xidLastCommit;
 	CommitTimestampEntry dataLastCommit;
-	bool	commitTsActive;
+	bool		commitTsActive;
 } CommitTimestampShared;
 
 CommitTimestampShared *commitTsShared;
@@ -153,9 +154,9 @@ TransactionTreeSetCommitTsData(TransactionId xid, int nsubxids,
 	 * No-op if the module is not active.
 	 *
 	 * An unlocked read here is fine, because in a standby (the only place
-	 * where the flag can change in flight) this routine is only called by
-	 * the recovery process, which is also the only process which can change
-	 * the flag.
+	 * where the flag can change in flight) this routine is only called by the
+	 * recovery process, which is also the only process which can change the
+	 * flag.
 	 */
 	if (!commitTsShared->commitTsActive)
 		return;
@@ -767,8 +768,8 @@ ExtendCommitTs(TransactionId newestXact)
 	int			pageno;
 
 	/*
-	 * Nothing to do if module not enabled.  Note we do an unlocked read of the
-	 * flag here, which is okay because this routine is only called from
+	 * Nothing to do if module not enabled.  Note we do an unlocked read of
+	 * the flag here, which is okay because this routine is only called from
 	 * GetNewTransactionId, which is never called in a standby.
 	 */
 	Assert(!InRecovery);
@@ -843,6 +844,8 @@ SetCommitTsLimit(TransactionId oldestXact, TransactionId newestXact)
 	else
 	{
 		Assert(ShmemVariableCache->newestCommitTsXid == InvalidTransactionId);
+		ShmemVariableCache->oldestCommitTsXid = oldestXact;
+		ShmemVariableCache->newestCommitTsXid = newestXact;
 	}
 	LWLockRelease(CommitTsLock);
 }
@@ -855,7 +858,7 @@ AdvanceOldestCommitTsXid(TransactionId oldestXact)
 {
 	LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
 	if (ShmemVariableCache->oldestCommitTsXid != InvalidTransactionId &&
-		TransactionIdPrecedes(ShmemVariableCache->oldestCommitTsXid, oldestXact))
+	TransactionIdPrecedes(ShmemVariableCache->oldestCommitTsXid, oldestXact))
 		ShmemVariableCache->oldestCommitTsXid = oldestXact;
 	LWLockRelease(CommitTsLock);
 }

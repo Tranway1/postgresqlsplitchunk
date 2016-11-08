@@ -190,6 +190,7 @@ typedef struct autovac_table
 	int			at_vacuum_cost_delay;
 	int			at_vacuum_cost_limit;
 	bool		at_dobalance;
+	bool		at_sharedrel;
 	char	   *at_relname;
 	char	   *at_nspname;
 	char	   *at_datname;
@@ -203,6 +204,7 @@ typedef struct autovac_table
  * wi_links		entry into free list or running list
  * wi_dboid		OID of the database this worker is supposed to work on
  * wi_tableoid	OID of the table currently being vacuumed, if any
+ * wi_sharedrel flag indicating whether table is marked relisshared
  * wi_proc		pointer to PGPROC of the running worker, NULL if not started
  * wi_launchtime Time at which this worker was launched
  * wi_cost_*	Vacuum cost-based delay parameters current in this worker
@@ -220,6 +222,7 @@ typedef struct WorkerInfoData
 	PGPROC	   *wi_proc;
 	TimestampTz wi_launchtime;
 	bool		wi_dobalance;
+	bool		wi_sharedrel;
 	int			wi_cost_delay;
 	int			wi_cost_limit;
 	int			wi_cost_limit_base;
@@ -459,9 +462,7 @@ AutoVacLauncherMain(int argc, char *argv[])
 	 */
 	AutovacMemCxt = AllocSetContextCreate(TopMemoryContext,
 										  "Autovacuum Launcher",
-										  ALLOCSET_DEFAULT_MINSIZE,
-										  ALLOCSET_DEFAULT_INITSIZE,
-										  ALLOCSET_DEFAULT_MAXSIZE);
+										  ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(AutovacMemCxt);
 
 	/*
@@ -535,11 +536,13 @@ AutoVacLauncherMain(int argc, char *argv[])
 	SetConfigOption("zero_damaged_pages", "false", PGC_SUSET, PGC_S_OVERRIDE);
 
 	/*
-	 * Force statement_timeout and lock_timeout to zero to avoid letting these
-	 * settings prevent regular maintenance from being executed.
+	 * Force settable timeouts off to avoid letting these settings prevent
+	 * regular maintenance from being executed.
 	 */
 	SetConfigOption("statement_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("lock_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
+	SetConfigOption("idle_in_transaction_session_timeout", "0",
+					PGC_SUSET, PGC_S_OVERRIDE);
 
 	/*
 	 * Force default_transaction_isolation to READ COMMITTED.  We don't want
@@ -595,7 +598,8 @@ AutoVacLauncherMain(int argc, char *argv[])
 		 */
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   (nap.tv_sec * 1000L) + (nap.tv_usec / 1000L));
+					   (nap.tv_sec * 1000L) + (nap.tv_usec / 1000L),
+					   WAIT_EVENT_AUTOVACUUM_MAIN);
 
 		ResetLatch(MyLatch);
 
@@ -669,9 +673,9 @@ AutoVacLauncherMain(int argc, char *argv[])
 
 		/*
 		 * There are some conditions that we need to check before trying to
-		 * start a worker.  First, we need to make sure that there is a
-		 * worker slot available.  Second, we need to make sure that no
-		 * other worker failed while starting up.
+		 * start a worker.  First, we need to make sure that there is a worker
+		 * slot available.  Second, we need to make sure that no other worker
+		 * failed while starting up.
 		 */
 
 		current_time = GetCurrentTimestamp();
@@ -717,6 +721,7 @@ AutoVacLauncherMain(int argc, char *argv[])
 					worker = AutoVacuumShmem->av_startingWorker;
 					worker->wi_dboid = InvalidOid;
 					worker->wi_tableoid = InvalidOid;
+					worker->wi_sharedrel = false;
 					worker->wi_proc = NULL;
 					worker->wi_launchtime = 0;
 					dlist_push_head(&AutoVacuumShmem->av_freeWorkers,
@@ -888,14 +893,10 @@ rebuild_database_list(Oid newdb)
 
 	newcxt = AllocSetContextCreate(AutovacMemCxt,
 								   "AV dblist",
-								   ALLOCSET_DEFAULT_MINSIZE,
-								   ALLOCSET_DEFAULT_INITSIZE,
-								   ALLOCSET_DEFAULT_MAXSIZE);
+								   ALLOCSET_DEFAULT_SIZES);
 	tmpcxt = AllocSetContextCreate(newcxt,
 								   "tmp AV dblist",
-								   ALLOCSET_DEFAULT_MINSIZE,
-								   ALLOCSET_DEFAULT_INITSIZE,
-								   ALLOCSET_DEFAULT_MAXSIZE);
+								   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(tmpcxt);
 
 	/*
@@ -1105,9 +1106,7 @@ do_start_worker(void)
 	 */
 	tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
 								   "Start worker tmp cxt",
-								   ALLOCSET_DEFAULT_MINSIZE,
-								   ALLOCSET_DEFAULT_INITSIZE,
-								   ALLOCSET_DEFAULT_MAXSIZE);
+								   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(tmpcxt);
 
 	/* use fresh stats */
@@ -1547,11 +1546,13 @@ AutoVacWorkerMain(int argc, char *argv[])
 	SetConfigOption("zero_damaged_pages", "false", PGC_SUSET, PGC_S_OVERRIDE);
 
 	/*
-	 * Force statement_timeout and lock_timeout to zero to avoid letting these
-	 * settings prevent regular maintenance from being executed.
+	 * Force settable timeouts off to avoid letting these settings prevent
+	 * regular maintenance from being executed.
 	 */
 	SetConfigOption("statement_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("lock_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
+	SetConfigOption("idle_in_transaction_session_timeout", "0",
+					PGC_SUSET, PGC_S_OVERRIDE);
 
 	/*
 	 * Force default_transaction_isolation to READ COMMITTED.  We don't want
@@ -1683,6 +1684,7 @@ FreeWorkerInfo(int code, Datum arg)
 		dlist_delete(&MyWorkerInfo->wi_links);
 		MyWorkerInfo->wi_dboid = InvalidOid;
 		MyWorkerInfo->wi_tableoid = InvalidOid;
+		MyWorkerInfo->wi_sharedrel = false;
 		MyWorkerInfo->wi_proc = NULL;
 		MyWorkerInfo->wi_launchtime = 0;
 		MyWorkerInfo->wi_dobalance = false;
@@ -1902,9 +1904,7 @@ do_autovacuum(void)
 	 */
 	AutovacMemCxt = AllocSetContextCreate(TopMemoryContext,
 										  "AV worker",
-										  ALLOCSET_DEFAULT_MINSIZE,
-										  ALLOCSET_DEFAULT_INITSIZE,
-										  ALLOCSET_DEFAULT_MAXSIZE);
+										  ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(AutovacMemCxt);
 
 	/*
@@ -2174,9 +2174,7 @@ do_autovacuum(void)
 	 */
 	PortalContext = AllocSetContextCreate(AutovacMemCxt,
 										  "Autovacuum Portal",
-										  ALLOCSET_DEFAULT_INITSIZE,
-										  ALLOCSET_DEFAULT_MINSIZE,
-										  ALLOCSET_DEFAULT_MAXSIZE);
+										  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Perform operations on collected tables.
@@ -2229,8 +2227,8 @@ do_autovacuum(void)
 			if (worker == MyWorkerInfo)
 				continue;
 
-			/* ignore workers in other databases */
-			if (worker->wi_dboid != MyDatabaseId)
+			/* ignore workers in other databases (unless table is shared) */
+			if (!worker->wi_sharedrel && worker->wi_dboid != MyDatabaseId)
 				continue;
 
 			if (worker->wi_tableoid == relid)
@@ -2271,6 +2269,7 @@ do_autovacuum(void)
 		 * the lock so that other workers don't vacuum it concurrently.
 		 */
 		MyWorkerInfo->wi_tableoid = relid;
+		MyWorkerInfo->wi_sharedrel = tab->at_sharedrel;
 		LWLockRelease(AutovacuumScheduleLock);
 
 		/*
@@ -2382,6 +2381,7 @@ deleted:
 		 */
 		LWLockAcquire(AutovacuumLock, LW_EXCLUSIVE);
 		MyWorkerInfo->wi_tableoid = InvalidOid;
+		MyWorkerInfo->wi_sharedrel = false;
 		LWLockRelease(AutovacuumLock);
 
 		/* restore vacuum cost GUCs for the next iteration */
@@ -2577,6 +2577,7 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 
 		tab = palloc(sizeof(autovac_table));
 		tab->at_relid = relid;
+		tab->at_sharedrel = classForm->relisshared;
 		tab->at_vacoptions = VACOPT_SKIPTOAST |
 			(dovacuum ? VACOPT_VACUUM : 0) |
 			(doanalyze ? VACOPT_ANALYZE : 0) |

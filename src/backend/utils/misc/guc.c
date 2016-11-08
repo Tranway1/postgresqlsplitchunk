@@ -34,6 +34,7 @@
 #include "catalog/namespace.h"
 #include "commands/async.h"
 #include "commands/prepare.h"
+#include "commands/user.h"
 #include "commands/vacuum.h"
 #include "commands/variable.h"
 #include "commands/trigger.h"
@@ -394,6 +395,24 @@ static const struct config_enum_entry force_parallel_mode_options[] = {
 };
 
 /*
+ * password_encryption used to be a boolean, so accept all the likely
+ * variants of "on" and "off", too.
+ */
+static const struct config_enum_entry password_encryption_options[] = {
+	{"plain", PASSWORD_TYPE_PLAINTEXT, false},
+	{"md5", PASSWORD_TYPE_MD5, false},
+	{"off", PASSWORD_TYPE_PLAINTEXT, false},
+	{"on", PASSWORD_TYPE_MD5, false},
+	{"true", PASSWORD_TYPE_MD5, true},
+	{"false", PASSWORD_TYPE_PLAINTEXT, true},
+	{"yes", PASSWORD_TYPE_MD5, true},
+	{"no", PASSWORD_TYPE_PLAINTEXT, true},
+	{"1", PASSWORD_TYPE_MD5, true},
+	{"0", PASSWORD_TYPE_PLAINTEXT, true},
+	{NULL, 0, false}
+};
+
+/*
  * Options for enum values stored in other modules
  */
 extern const struct config_enum_entry wal_level_options[];
@@ -422,8 +441,6 @@ bool		row_security;
 bool		check_function_bodies = true;
 bool		default_with_oids = false;
 bool		SQL_inheritance = true;
-
-bool		Password_encryption = true;
 
 int			log_min_error_statement = ERROR;
 int			log_min_messages = WARNING;
@@ -877,15 +894,6 @@ static struct config_bool ConfigureNamesBool[] =
 		true,
 		NULL, NULL, NULL
 	},
-	{
-		{"enable_fkey_estimates", PGC_USERSET, QUERY_TUNING_METHOD,
-			gettext_noop("Enables use of foreign keys for estimating joins."),
-			NULL
-		},
-		&enable_fkey_estimates,
-		true,
-		NULL, NULL, NULL
-	},
 
 	{
 		{"geqo", PGC_USERSET, QUERY_TUNING_GEQO,
@@ -1219,7 +1227,11 @@ static struct config_bool ConfigureNamesBool[] =
 			gettext_noop("Enables updating of the process title every time a new SQL command is received by the server.")
 		},
 		&update_process_title,
+#ifdef WIN32
+		false,
+#else
 		true,
+#endif
 		NULL, NULL, NULL
 	},
 
@@ -1315,17 +1327,6 @@ static struct config_bool ConfigureNamesBool[] =
 			NULL
 		},
 		&SQL_inheritance,
-		true,
-		NULL, NULL, NULL
-	},
-	{
-		{"password_encryption", PGC_USERSET, CONN_AUTH_SECURITY,
-			gettext_noop("Encrypt passwords."),
-			gettext_noop("When a password is specified in CREATE USER or "
-			   "ALTER USER without writing either ENCRYPTED or UNENCRYPTED, "
-						 "this parameter determines whether the password is to be encrypted.")
-		},
-		&Password_encryption,
 		true,
 		NULL, NULL, NULL
 	},
@@ -1956,7 +1957,7 @@ static struct config_int ConfigureNamesInt[] =
 
 	{
 		{"temp_file_limit", PGC_SUSET, RESOURCES_DISK,
-			gettext_noop("Limits the total size of all temporary files used by each session."),
+			gettext_noop("Limits the total size of all temporary files used by each process."),
 			gettext_noop("-1 means no limit."),
 			GUC_UNIT_KB
 		},
@@ -2255,7 +2256,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_S
 		},
 		&CheckPointTimeout,
-		300, 30, 3600,
+		300, 30, 86400,
 		NULL, NULL, NULL
 	},
 
@@ -2466,8 +2467,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_BLOCKS
 		},
 		&backend_flush_after,
-		/* see bufmgr.h: OS dependent default */
-		DEFAULT_BACKEND_FLUSH_AFTER, 0, WRITEBACK_MAX_PENDING_FLUSHES,
+		0, 0, WRITEBACK_MAX_PENDING_FLUSHES,
 		NULL, NULL, NULL
 	},
 
@@ -2479,7 +2479,7 @@ static struct config_int ConfigureNamesInt[] =
 			NULL,
 		},
 		&max_worker_processes,
-		8, 1, MAX_BACKENDS,
+		8, 0, MAX_BACKENDS,
 		check_max_worker_processes, NULL, NULL
 	},
 
@@ -2657,12 +2657,12 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"max_parallel_degree", PGC_USERSET, RESOURCES_ASYNCHRONOUS,
+		{"max_parallel_workers_per_gather", PGC_USERSET, RESOURCES_ASYNCHRONOUS,
 			gettext_noop("Sets the maximum number of parallel processes per executor node."),
 			NULL
 		},
-		&max_parallel_degree,
-		2, 0, MAX_BACKENDS,
+		&max_parallel_workers_per_gather,
+		2, 0, 1024,
 		NULL, NULL, NULL
 	},
 
@@ -2754,6 +2754,17 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&effective_cache_size,
 		DEFAULT_EFFECTIVE_CACHE_SIZE, 1, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"min_parallel_relation_size", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Sets the minimum size of relations to be considered for parallel scan."),
+			NULL,
+			GUC_UNIT_BLOCKS,
+		},
+		&min_parallel_relation_size,
+		(8 * 1024 * 1024) / BLCKSZ, 0, INT_MAX / 3,
 		NULL, NULL, NULL
 	},
 
@@ -2878,7 +2889,7 @@ static struct config_real ConfigureNamesReal[] =
 	{
 		{"parallel_setup_cost", PGC_USERSET, QUERY_TUNING_COST,
 			gettext_noop("Sets the planner's estimate of the cost of "
-				  "starting up worker processes for parallel query."),
+						 "starting up worker processes for parallel query."),
 			NULL
 		},
 		&parallel_setup_cost,
@@ -3003,7 +3014,7 @@ static struct config_string ConfigureNamesString[] =
 			gettext_noop("If blank, no prefix is used.")
 		},
 		&Log_line_prefix,
-		"",
+		"%m [%p] ",
 		NULL, NULL, NULL
 	},
 
@@ -3802,6 +3813,18 @@ static struct config_enum ConfigureNamesEnum[] =
 		},
 		&force_parallel_mode,
 		FORCE_PARALLEL_OFF, force_parallel_mode_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"password_encryption", PGC_USERSET, CONN_AUTH_SECURITY,
+			gettext_noop("Encrypt passwords."),
+			gettext_noop("When a password is specified in CREATE USER or "
+			   "ALTER USER without writing either ENCRYPTED or UNENCRYPTED, "
+						 "this parameter determines whether the password is to be encrypted.")
+		},
+		&Password_encryption,
+		PASSWORD_TYPE_MD5, password_encryption_options,
 		NULL, NULL, NULL
 	},
 
@@ -5935,13 +5958,14 @@ set_config_option(const char *name, const char *value,
 				 * don't re-read the config file during backend start.
 				 *
 				 * In EXEC_BACKEND builds, this works differently: we load all
-				 * non-default settings from the CONFIG_EXEC_PARAMS file during
-				 * backend start.  In that case we must accept PGC_SIGHUP
-				 * settings, so as to have the same value as if we'd forked
-				 * from the postmaster.  This can also happen when using
-				 * RestoreGUCState() within a background worker that needs to
-				 * have the same settings as the user backend that started it.
-				 * is_reload will be true when either situation applies.
+				 * non-default settings from the CONFIG_EXEC_PARAMS file
+				 * during backend start.  In that case we must accept
+				 * PGC_SIGHUP settings, so as to have the same value as if
+				 * we'd forked from the postmaster.  This can also happen when
+				 * using RestoreGUCState() within a background worker that
+				 * needs to have the same settings as the user backend that
+				 * started it. is_reload will be true when either situation
+				 * applies.
 				 */
 				if (IsUnderPostmaster && !is_reload)
 					return -1;
@@ -7992,20 +8016,23 @@ GetConfigOptionByNum(int varnum, const char **values, bool *noshow)
 	/* unit */
 	if (conf->vartype == PGC_INT)
 	{
-		static char buf[8];
-
 		switch (conf->flags & (GUC_UNIT_MEMORY | GUC_UNIT_TIME))
 		{
 			case GUC_UNIT_KB:
 				values[2] = "kB";
 				break;
 			case GUC_UNIT_BLOCKS:
-				snprintf(buf, sizeof(buf), "%dkB", BLCKSZ / 1024);
-				values[2] = buf;
+				snprintf(buffer, sizeof(buffer), "%dkB", BLCKSZ / 1024);
+				values[2] = pstrdup(buffer);
 				break;
 			case GUC_UNIT_XBLOCKS:
-				snprintf(buf, sizeof(buf), "%dkB", XLOG_BLCKSZ / 1024);
-				values[2] = buf;
+				snprintf(buffer, sizeof(buffer), "%dkB", XLOG_BLCKSZ / 1024);
+				values[2] = pstrdup(buffer);
+				break;
+			case GUC_UNIT_XSEGS:
+				snprintf(buffer, sizeof(buffer), "%dMB",
+						 XLOG_SEG_SIZE / (1024 * 1024));
+				values[2] = pstrdup(buffer);
 				break;
 			case GUC_UNIT_MS:
 				values[2] = "ms";
@@ -8016,7 +8043,12 @@ GetConfigOptionByNum(int varnum, const char **values, bool *noshow)
 			case GUC_UNIT_MIN:
 				values[2] = "min";
 				break;
+			case 0:
+				values[2] = NULL;
+				break;
 			default:
+				elog(ERROR, "unrecognized GUC units value: %d",
+					 conf->flags & (GUC_UNIT_MEMORY | GUC_UNIT_TIME));
 				values[2] = NULL;
 				break;
 		}

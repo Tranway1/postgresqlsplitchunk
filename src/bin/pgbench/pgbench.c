@@ -38,6 +38,7 @@
 #include "portability/instr_time.h"
 
 #include <ctype.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -185,11 +186,20 @@ const char *progname;
 
 volatile bool timer_exceeded = false;	/* flag from signal handler */
 
-/* variable definitions */
+/*
+ * Variable definitions.  If a variable has a string value, "value" is that
+ * value, is_numeric is false, and num_value is undefined.  If the value is
+ * known to be numeric, is_numeric is true and num_value contains the value
+ * (in any permitted numeric variant).  In this case "value" contains the
+ * string equivalent of the number, if we've had occasion to compute that,
+ * or NULL if we haven't.
+ */
 typedef struct
 {
-	char	   *name;			/* variable name */
-	char	   *value;			/* its value */
+	char	   *name;			/* variable's name */
+	char	   *value;			/* its value in string form, if known */
+	bool		is_numeric;		/* is numeric value known? */
+	PgBenchValue num_value;		/* variable's value in numeric form */
 } Variable;
 
 #define MAX_SCRIPTS		128		/* max number of SQL scripts allowed */
@@ -225,23 +235,95 @@ typedef struct StatsData
 } StatsData;
 
 /*
- * Connection state
+ * Connection state machine states.
+ */
+typedef enum
+{
+	/*
+	 * The client must first choose a script to execute.  Once chosen, it can
+	 * either be throttled (state CSTATE_START_THROTTLE under --rate) or start
+	 * right away (state CSTATE_START_TX).
+	 */
+	CSTATE_CHOOSE_SCRIPT,
+
+	/*
+	 * In CSTATE_START_THROTTLE state, we calculate when to begin the next
+	 * transaction, and advance to CSTATE_THROTTLE.  CSTATE_THROTTLE state
+	 * sleeps until that moment.  (If throttling is not enabled, doCustom()
+	 * falls directly through from CSTATE_START_THROTTLE to CSTATE_START_TX.)
+	 */
+	CSTATE_START_THROTTLE,
+	CSTATE_THROTTLE,
+
+	/*
+	 * CSTATE_START_TX performs start-of-transaction processing.  Establishes
+	 * a new connection for the transaction, in --connect mode, and records
+	 * the transaction start time.
+	 */
+	CSTATE_START_TX,
+
+	/*
+	 * We loop through these states, to process each command in the script:
+	 *
+	 * CSTATE_START_COMMAND starts the execution of a command.  On a SQL
+	 * command, the command is sent to the server, and we move to
+	 * CSTATE_WAIT_RESULT state.  On a \sleep meta-command, the timer is set,
+	 * and we enter the CSTATE_SLEEP state to wait for it to expire. Other
+	 * meta-commands are executed immediately.
+	 *
+	 * CSTATE_WAIT_RESULT waits until we get a result set back from the server
+	 * for the current command.
+	 *
+	 * CSTATE_SLEEP waits until the end of \sleep.
+	 *
+	 * CSTATE_END_COMMAND records the end-of-command timestamp, increments the
+	 * command counter, and loops back to CSTATE_START_COMMAND state.
+	 */
+	CSTATE_START_COMMAND,
+	CSTATE_WAIT_RESULT,
+	CSTATE_SLEEP,
+	CSTATE_END_COMMAND,
+
+	/*
+	 * CSTATE_END_TX performs end-of-transaction processing.  Calculates
+	 * latency, and logs the transaction.  In --connect mode, closes the
+	 * current connection.  Chooses the next script to execute and starts over
+	 * in CSTATE_START_THROTTLE state, or enters CSTATE_FINISHED if we have no
+	 * more work to do.
+	 */
+	CSTATE_END_TX,
+
+	/*
+	 * Final states.  CSTATE_ABORTED means that the script execution was
+	 * aborted because a command failed, CSTATE_FINISHED means success.
+	 */
+	CSTATE_ABORTED,
+	CSTATE_FINISHED
+} ConnectionStateEnum;
+
+/*
+ * Connection state.
  */
 typedef struct
 {
 	PGconn	   *con;			/* connection handle to DB */
 	int			id;				/* client No. */
-	int			state;			/* state No. */
-	bool		listen;			/* whether an async query has been sent */
-	bool		sleeping;		/* whether the client is napping */
-	bool		throttling;		/* whether nap is for throttling */
-	bool		is_throttled;	/* whether transaction throttling is done */
+	ConnectionStateEnum state;	/* state machine's current state. */
+
+	int			use_file;		/* index in sql_script for this client */
+	int			command;		/* command number in script */
+
+	/* client variables */
 	Variable   *variables;		/* array of variable definitions */
-	int			nvariables;
+	int			nvariables;		/* number of variables */
+	bool		vars_sorted;	/* are variables sorted by name? */
+
+	/* various times about current transaction */
 	int64		txn_scheduled;	/* scheduled start time of transaction (usec) */
+	int64		sleep_until;	/* scheduled start time of next cmd (usec) */
 	instr_time	txn_begin;		/* used for measuring schedule lag times */
 	instr_time	stmt_begin;		/* used for measuring statement latencies */
-	int			use_file;		/* index in sql_scripts for this client */
+
 	bool		prepared[MAX_SCRIPTS];	/* whether client prepared the script */
 
 	/* per client collected stats */
@@ -363,6 +445,8 @@ static const BuiltinScript builtin_script[] =
 
 
 /* Function prototypes */
+static void setIntValue(PgBenchValue *pv, int64 ival);
+static void setDoubleValue(PgBenchValue *pv, double dval);
 static bool evaluateExpr(TState *, CState *, PgBenchExpr *, PgBenchValue *);
 static void doLog(TState *thread, CState *st, instr_time *now,
 	  StatsData *agg, bool skipped, double latency, double lag);
@@ -425,8 +509,8 @@ usage(void)
 		 "  -T, --time=NUM           duration of benchmark test in seconds\n"
 		   "  -v, --vacuum-all         vacuum all four standard tables before tests\n"
 		   "  --aggregate-interval=NUM aggregate data over NUM seconds\n"
-		   "  --sampling-rate=NUM      fraction of transactions to log (e.g. 0.01 for 1%%)\n"
 		"  --progress-timestamp     use Unix epoch timestamps for progress\n"
+		   "  --sampling-rate=NUM      fraction of transactions to log (e.g., 0.01 for 1%%)\n"
 		   "\nCommon options:\n"
 		   "  -d, --debug              print debugging output\n"
 	  "  -h, --host=HOSTNAME      database server host or socket directory\n"
@@ -760,8 +844,9 @@ static PGconn *
 doConnect(void)
 {
 	PGconn	   *conn;
-	static char *password = NULL;
 	bool		new_pass;
+	static bool have_password = false;
+	static char password[100];
 
 	/*
 	 * Start the connection.  Loop until we have a password if requested by
@@ -781,7 +866,7 @@ doConnect(void)
 		keywords[2] = "user";
 		values[2] = login;
 		keywords[3] = "password";
-		values[3] = password;
+		values[3] = have_password ? password : NULL;
 		keywords[4] = "dbname";
 		values[4] = dbName;
 		keywords[5] = "fallback_application_name";
@@ -802,10 +887,11 @@ doConnect(void)
 
 		if (PQstatus(conn) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(conn) &&
-			password == NULL)
+			!have_password)
 		{
 			PQfinish(conn);
-			password = simple_prompt("Password: ", 100, false);
+			simple_prompt("Password: ", password, sizeof(password), false);
+			have_password = true;
 			new_pass = true;
 		}
 	} while (new_pass);
@@ -836,33 +922,98 @@ discard_response(CState *state)
 	} while (res);
 }
 
+/* qsort comparator for Variable array */
 static int
-compareVariables(const void *v1, const void *v2)
+compareVariableNames(const void *v1, const void *v2)
 {
 	return strcmp(((const Variable *) v1)->name,
 				  ((const Variable *) v2)->name);
 }
 
-static char *
-getVariable(CState *st, char *name)
+/* Locate a variable by name; returns NULL if unknown */
+static Variable *
+lookupVariable(CState *st, char *name)
 {
-	Variable	key,
-			   *var;
+	Variable	key;
 
 	/* On some versions of Solaris, bsearch of zero items dumps core */
 	if (st->nvariables <= 0)
 		return NULL;
 
+	/* Sort if we have to */
+	if (!st->vars_sorted)
+	{
+		qsort((void *) st->variables, st->nvariables, sizeof(Variable),
+			  compareVariableNames);
+		st->vars_sorted = true;
+	}
+
+	/* Now we can search */
 	key.name = name;
-	var = (Variable *) bsearch((void *) &key,
-							   (void *) st->variables,
-							   st->nvariables,
-							   sizeof(Variable),
-							   compareVariables);
-	if (var != NULL)
-		return var->value;
+	return (Variable *) bsearch((void *) &key,
+								(void *) st->variables,
+								st->nvariables,
+								sizeof(Variable),
+								compareVariableNames);
+}
+
+/* Get the value of a variable, in string form; returns NULL if unknown */
+static char *
+getVariable(CState *st, char *name)
+{
+	Variable   *var;
+	char		stringform[64];
+
+	var = lookupVariable(st, name);
+	if (var == NULL)
+		return NULL;			/* not found */
+
+	if (var->value)
+		return var->value;		/* we have it in string form */
+
+	/* We need to produce a string equivalent of the numeric value */
+	Assert(var->is_numeric);
+	if (var->num_value.type == PGBT_INT)
+		snprintf(stringform, sizeof(stringform),
+				 INT64_FORMAT, var->num_value.u.ival);
 	else
-		return NULL;
+	{
+		Assert(var->num_value.type == PGBT_DOUBLE);
+		snprintf(stringform, sizeof(stringform),
+				 "%.*g", DBL_DIG, var->num_value.u.dval);
+	}
+	var->value = pg_strdup(stringform);
+	return var->value;
+}
+
+/* Try to convert variable to numeric form; return false on failure */
+static bool
+makeVariableNumeric(Variable *var)
+{
+	if (var->is_numeric)
+		return true;			/* no work */
+
+	if (is_an_int(var->value))
+	{
+		setIntValue(&var->num_value, strtoint64(var->value));
+		var->is_numeric = true;
+	}
+	else	/* type should be double */
+	{
+		double		dv;
+		char		xs;
+
+		if (sscanf(var->value, "%lf%c", &dv, &xs) != 1)
+		{
+			fprintf(stderr,
+					"malformed variable \"%s\" value: \"%s\"\n",
+					var->name, var->value);
+			return false;
+		}
+		setDoubleValue(&var->num_value, dv);
+		var->is_numeric = true;
+	}
+	return true;
 }
 
 /* check whether the name consists of alphabets, numerals and underscores. */
@@ -877,26 +1028,20 @@ isLegalVariableName(const char *name)
 			return false;
 	}
 
-	return true;
+	return (i > 0);				/* must be non-empty */
 }
 
-static int
-putVariable(CState *st, const char *context, char *name, char *value)
+/*
+ * Lookup a variable by name, creating it if need be.
+ * Caller is expected to assign a value to the variable.
+ * Returns NULL on failure (bad name).
+ */
+static Variable *
+lookupCreateVariable(CState *st, const char *context, char *name)
 {
-	Variable	key,
-			   *var;
+	Variable   *var;
 
-	key.name = name;
-	/* On some versions of Solaris, bsearch of zero items dumps core */
-	if (st->nvariables > 0)
-		var = (Variable *) bsearch((void *) &key,
-								   (void *) st->variables,
-								   st->nvariables,
-								   sizeof(Variable),
-								   compareVariables);
-	else
-		var = NULL;
-
+	var = lookupVariable(st, name);
 	if (var == NULL)
 	{
 		Variable   *newvars;
@@ -909,9 +1054,10 @@ putVariable(CState *st, const char *context, char *name, char *value)
 		{
 			fprintf(stderr, "%s: invalid variable name: \"%s\"\n",
 					context, name);
-			return false;
+			return NULL;
 		}
 
+		/* Create variable at the end of the array */
 		if (st->variables)
 			newvars = (Variable *) pg_realloc(st->variables,
 									(st->nvariables + 1) * sizeof(Variable));
@@ -923,25 +1069,70 @@ putVariable(CState *st, const char *context, char *name, char *value)
 		var = &newvars[st->nvariables];
 
 		var->name = pg_strdup(name);
-		var->value = pg_strdup(value);
+		var->value = NULL;
+		/* caller is expected to initialize remaining fields */
 
 		st->nvariables++;
-
-		qsort((void *) st->variables, st->nvariables, sizeof(Variable),
-			  compareVariables);
+		/* we don't re-sort the array till we have to */
+		st->vars_sorted = false;
 	}
-	else
-	{
-		char	   *val;
 
-		/* dup then free, in case value is pointing at this variable */
-		val = pg_strdup(value);
+	return var;
+}
 
+/* Assign a string value to a variable, creating it if need be */
+/* Returns false on failure (bad name) */
+static bool
+putVariable(CState *st, const char *context, char *name, const char *value)
+{
+	Variable   *var;
+	char	   *val;
+
+	var = lookupCreateVariable(st, context, name);
+	if (!var)
+		return false;
+
+	/* dup then free, in case value is pointing at this variable */
+	val = pg_strdup(value);
+
+	if (var->value)
 		free(var->value);
-		var->value = val;
-	}
+	var->value = val;
+	var->is_numeric = false;
 
 	return true;
+}
+
+/* Assign a numeric value to a variable, creating it if need be */
+/* Returns false on failure (bad name) */
+static bool
+putVariableNumber(CState *st, const char *context, char *name,
+				  const PgBenchValue *value)
+{
+	Variable   *var;
+
+	var = lookupCreateVariable(st, context, name);
+	if (!var)
+		return false;
+
+	if (var->value)
+		free(var->value);
+	var->value = NULL;
+	var->is_numeric = true;
+	var->num_value = *value;
+
+	return true;
+}
+
+/* Assign an integer value to a variable, creating it if need be */
+/* Returns false on failure (bad name) */
+static bool
+putVariableInt(CState *st, const char *context, char *name, int64 value)
+{
+	PgBenchValue val;
+
+	setIntValue(&val, value);
+	return putVariableNumber(st, context, name, &val);
 }
 
 static char *
@@ -1041,7 +1232,8 @@ coerceToInt(PgBenchValue *pval, int64 *ival)
 	}
 	else
 	{
-		double dval = pval->u.dval;
+		double		dval = pval->u.dval;
+
 		Assert(pval->type == PGBT_DOUBLE);
 		if (dval < PG_INT64_MIN || PG_INT64_MAX < dval)
 		{
@@ -1097,8 +1289,8 @@ evalFunc(TState *thread, CState *st,
 		 PgBenchFunction func, PgBenchExprLink *args, PgBenchValue *retval)
 {
 	/* evaluate all function arguments */
-	int	 			nargs = 0;
-	PgBenchValue 	vargs[MAX_FARGS];
+	int			nargs = 0;
+	PgBenchValue vargs[MAX_FARGS];
 	PgBenchExprLink *l = args;
 
 	for (nargs = 0; nargs < MAX_FARGS && l != NULL; nargs++, l = l->next)
@@ -1115,22 +1307,24 @@ evalFunc(TState *thread, CState *st,
 	/* then evaluate function */
 	switch (func)
 	{
-		/* overloaded operators */
+			/* overloaded operators */
 		case PGBENCH_ADD:
 		case PGBENCH_SUB:
 		case PGBENCH_MUL:
 		case PGBENCH_DIV:
 		case PGBENCH_MOD:
 			{
-				PgBenchValue	*lval = &vargs[0],
-								*rval = &vargs[1];
+				PgBenchValue *lval = &vargs[0],
+						   *rval = &vargs[1];
+
 				Assert(nargs == 2);
 
 				/* overloaded type management, double if some double */
 				if ((lval->type == PGBT_DOUBLE ||
 					 rval->type == PGBT_DOUBLE) && func != PGBENCH_MOD)
 				{
-					double ld, rd;
+					double		ld,
+								rd;
 
 					if (!coerceToDouble(lval, &ld) ||
 						!coerceToDouble(rval, &rd))
@@ -1159,9 +1353,10 @@ evalFunc(TState *thread, CState *st,
 							Assert(0);
 					}
 				}
-				else  /* we have integer operands, or % */
+				else	/* we have integer operands, or % */
 				{
-					int64 li, ri;
+					int64		li,
+								ri;
 
 					if (!coerceToInt(lval, &li) ||
 						!coerceToInt(rval, &ri))
@@ -1200,7 +1395,7 @@ evalFunc(TState *thread, CState *st,
 										return false;
 									}
 									else
-										setIntValue(retval, - li);
+										setIntValue(retval, -li);
 								}
 								else
 									setIntValue(retval, 0);
@@ -1209,7 +1404,7 @@ evalFunc(TState *thread, CState *st,
 							/* else divisor is not -1 */
 							if (func == PGBENCH_DIV)
 								setIntValue(retval, li / ri);
-							else /* func == PGBENCH_MOD */
+							else	/* func == PGBENCH_MOD */
 								setIntValue(retval, li % ri);
 
 							return true;
@@ -1221,27 +1416,30 @@ evalFunc(TState *thread, CState *st,
 				}
 			}
 
-		/* no arguments */
+			/* no arguments */
 		case PGBENCH_PI:
 			setDoubleValue(retval, M_PI);
 			return true;
 
-		/* 1 overloaded argument */
+			/* 1 overloaded argument */
 		case PGBENCH_ABS:
 			{
 				PgBenchValue *varg = &vargs[0];
+
 				Assert(nargs == 1);
 
 				if (varg->type == PGBT_INT)
 				{
-					int64 i = varg->u.ival;
+					int64		i = varg->u.ival;
+
 					setIntValue(retval, i < 0 ? -i : i);
 				}
 				else
 				{
-					double d = varg->u.dval;
+					double		d = varg->u.dval;
+
 					Assert(varg->type == PGBT_DOUBLE);
-					setDoubleValue(retval, d < 0.0 ? -d: d);
+					setDoubleValue(retval, d < 0.0 ? -d : d);
 				}
 
 				return true;
@@ -1250,17 +1448,18 @@ evalFunc(TState *thread, CState *st,
 		case PGBENCH_DEBUG:
 			{
 				PgBenchValue *varg = &vargs[0];
+
 				Assert(nargs == 1);
 
-				fprintf(stderr,	"debug(script=%d,command=%d): ",
-						st->use_file, st->state+1);
+				fprintf(stderr, "debug(script=%d,command=%d): ",
+						st->use_file, st->command + 1);
 
 				if (varg->type == PGBT_INT)
-					fprintf(stderr,	"int "INT64_FORMAT"\n", varg->u.ival);
+					fprintf(stderr, "int " INT64_FORMAT "\n", varg->u.ival);
 				else
 				{
 					Assert(varg->type == PGBT_DOUBLE);
-					fprintf(stderr, "double %f\n", varg->u.dval);
+					fprintf(stderr, "double %.*g\n", DBL_DIG, varg->u.dval);
 				}
 
 				*retval = *varg;
@@ -1268,11 +1467,12 @@ evalFunc(TState *thread, CState *st,
 				return true;
 			}
 
-		/* 1 double argument */
+			/* 1 double argument */
 		case PGBENCH_DOUBLE:
 		case PGBENCH_SQRT:
 			{
-				double dval;
+				double		dval;
+
 				Assert(nargs == 1);
 
 				if (!coerceToDouble(&vargs[0], &dval))
@@ -1285,10 +1485,11 @@ evalFunc(TState *thread, CState *st,
 				return true;
 			}
 
-		/* 1 int argument */
+			/* 1 int argument */
 		case PGBENCH_INT:
 			{
-				int64 ival;
+				int64		ival;
+
 				Assert(nargs == 1);
 
 				if (!coerceToInt(&vargs[0], &ival))
@@ -1298,102 +1499,137 @@ evalFunc(TState *thread, CState *st,
 				return true;
 			}
 
-		/* variable number of int arguments */
-		case PGBENCH_MIN:
-		case PGBENCH_MAX:
+			/* variable number of arguments */
+		case PGBENCH_LEAST:
+		case PGBENCH_GREATEST:
 			{
-				int64		extremum;
+				bool		havedouble;
 				int			i;
+
 				Assert(nargs >= 1);
 
-				if (!coerceToInt(&vargs[0], &extremum))
-					return false;
-
-				for (i = 1; i < nargs; i++)
+				/* need double result if any input is double */
+				havedouble = false;
+				for (i = 0; i < nargs; i++)
 				{
-					int64		ival;
-
-					if (!coerceToInt(&vargs[i], &ival))
-						return false;
-
-					if (func == PGBENCH_MIN)
-						extremum = extremum < ival ? extremum : ival;
-					else if (func == PGBENCH_MAX)
-						extremum = extremum > ival ? extremum : ival;
+					if (vargs[i].type == PGBT_DOUBLE)
+					{
+						havedouble = true;
+						break;
+					}
 				}
+				if (havedouble)
+				{
+					double		extremum;
 
-				setIntValue(retval, extremum);
+					if (!coerceToDouble(&vargs[0], &extremum))
+						return false;
+					for (i = 1; i < nargs; i++)
+					{
+						double		dval;
+
+						if (!coerceToDouble(&vargs[i], &dval))
+							return false;
+						if (func == PGBENCH_LEAST)
+							extremum = Min(extremum, dval);
+						else
+							extremum = Max(extremum, dval);
+					}
+					setDoubleValue(retval, extremum);
+				}
+				else
+				{
+					int64		extremum;
+
+					if (!coerceToInt(&vargs[0], &extremum))
+						return false;
+					for (i = 1; i < nargs; i++)
+					{
+						int64		ival;
+
+						if (!coerceToInt(&vargs[i], &ival))
+							return false;
+						if (func == PGBENCH_LEAST)
+							extremum = Min(extremum, ival);
+						else
+							extremum = Max(extremum, ival);
+					}
+					setIntValue(retval, extremum);
+				}
 				return true;
 			}
 
-		/* random functions */
+			/* random functions */
 		case PGBENCH_RANDOM:
 		case PGBENCH_RANDOM_EXPONENTIAL:
 		case PGBENCH_RANDOM_GAUSSIAN:
-		{
-			int64       imin, imax;
-			Assert(nargs >= 2);
-
-			if (!coerceToInt(&vargs[0], &imin) ||
-				!coerceToInt(&vargs[1], &imax))
-				return false;
-
-			/* check random range */
-			if (imin > imax)
 			{
-				fprintf(stderr, "empty range given to random\n");
-				return false;
-			}
-			else if (imax - imin < 0 || (imax - imin) + 1 < 0)
-			{
-				/* prevent int overflows in random functions */
-				fprintf(stderr, "random range is too large\n");
-				return false;
-			}
+				int64		imin,
+							imax;
 
-			if (func == PGBENCH_RANDOM)
-			{
-				Assert(nargs == 2);
-				setIntValue(retval, getrand(thread, imin, imax));
-			}
-			else /* gaussian & exponential */
-			{
-				double param;
-				Assert(nargs == 3);
+				Assert(nargs >= 2);
 
-				if (!coerceToDouble(&vargs[2], &param))
+				if (!coerceToInt(&vargs[0], &imin) ||
+					!coerceToInt(&vargs[1], &imax))
 					return false;
 
-				if (func == PGBENCH_RANDOM_GAUSSIAN)
+				/* check random range */
+				if (imin > imax)
 				{
-					if (param < MIN_GAUSSIAN_PARAM)
-					{
-						fprintf(stderr,
-								"gaussian parameter must be at least %f "
-								"(not %f)\n", MIN_GAUSSIAN_PARAM, param);
-						return false;
-					}
-
-					setIntValue(retval,
-								getGaussianRand(thread, imin, imax,	param));
+					fprintf(stderr, "empty range given to random\n");
+					return false;
 				}
-				else /* exponential */
+				else if (imax - imin < 0 || (imax - imin) + 1 < 0)
 				{
-					if (param <= 0.0)
-					{
-						fprintf(stderr,
-								"exponential parameter must be greater than zero"
-								" (got %f)\n", param);
-						return false;
-					}
-
-					setIntValue(retval,
-								getExponentialRand(thread, imin, imax, param));
+					/* prevent int overflows in random functions */
+					fprintf(stderr, "random range is too large\n");
+					return false;
 				}
+
+				if (func == PGBENCH_RANDOM)
+				{
+					Assert(nargs == 2);
+					setIntValue(retval, getrand(thread, imin, imax));
+				}
+				else	/* gaussian & exponential */
+				{
+					double		param;
+
+					Assert(nargs == 3);
+
+					if (!coerceToDouble(&vargs[2], &param))
+						return false;
+
+					if (func == PGBENCH_RANDOM_GAUSSIAN)
+					{
+						if (param < MIN_GAUSSIAN_PARAM)
+						{
+							fprintf(stderr,
+									"gaussian parameter must be at least %f "
+									"(not %f)\n", MIN_GAUSSIAN_PARAM, param);
+							return false;
+						}
+
+						setIntValue(retval,
+								 getGaussianRand(thread, imin, imax, param));
+					}
+					else	/* exponential */
+					{
+						if (param <= 0.0)
+						{
+							fprintf(stderr,
+							"exponential parameter must be greater than zero"
+									" (got %f)\n", param);
+							return false;
+						}
+
+						setIntValue(retval,
+							  getExponentialRand(thread, imin, imax, param));
+					}
+				}
+
+				return true;
 			}
-
-			return true;
-		}
 
 		default:
 			/* cannot get here */
@@ -1422,32 +1658,19 @@ evaluateExpr(TState *thread, CState *st, PgBenchExpr *expr, PgBenchValue *retval
 
 		case ENODE_VARIABLE:
 			{
-				char	   *var;
+				Variable   *var;
 
-				if ((var = getVariable(st, expr->u.variable.varname)) == NULL)
+				if ((var = lookupVariable(st, expr->u.variable.varname)) == NULL)
 				{
 					fprintf(stderr, "undefined variable \"%s\"\n",
 							expr->u.variable.varname);
 					return false;
 				}
 
-				if (is_an_int(var))
-				{
-					setIntValue(retval, strtoint64(var));
-				}
-				else /* type should be double */
-				{
-					double dv;
-					if (sscanf(var, "%lf", &dv) != 1)
-					{
-						fprintf(stderr,
-								"malformed variable \"%s\" value: \"%s\"\n",
-								expr->u.variable.varname, var);
-						return false;
-					}
-					setDoubleValue(retval, dv);
-				}
+				if (!makeVariableNumeric(var))
+					return false;
 
+				*retval = var->num_value;
 				return true;
 			}
 
@@ -1564,8 +1787,7 @@ runShellCommand(CState *st, char *variable, char **argv, int argc)
 				argv[0], res);
 		return false;
 	}
-	snprintf(res, sizeof(res), "%d", retval);
-	if (!putVariable(st, "setshell", variable, res))
+	if (!putVariableInt(st, "setshell", variable, retval))
 		return false;
 
 #ifdef DEBUG
@@ -1581,15 +1803,12 @@ preparedStatementName(char *buffer, int file, int state)
 	sprintf(buffer, "P%d_%d", file, state);
 }
 
-static bool
-clientDone(CState *st)
+static void
+commandFailed(CState *st, char *message)
 {
-	if (st->con != NULL)
-	{
-		PQfinish(st->con);
-		st->con = NULL;
-	}
-	return false;				/* always false */
+	fprintf(stderr,
+			"client %d aborted in command %d of script %d; %s\n",
+			st->id, st->command, st->use_file, message);
 }
 
 /* return a script number with a weighted choice. */
@@ -1611,432 +1830,595 @@ chooseScript(TState *thread)
 	return i - 1;
 }
 
-/* return false iff client should be disconnected */
+/* Send a SQL command, using the chosen querymode */
 static bool
+sendCommand(CState *st, Command *command)
+{
+	int			r;
+
+	if (querymode == QUERY_SIMPLE)
+	{
+		char	   *sql;
+
+		sql = pg_strdup(command->argv[0]);
+		sql = assignVariables(st, sql);
+
+		if (debug)
+			fprintf(stderr, "client %d sending %s\n", st->id, sql);
+		r = PQsendQuery(st->con, sql);
+		free(sql);
+	}
+	else if (querymode == QUERY_EXTENDED)
+	{
+		const char *sql = command->argv[0];
+		const char *params[MAX_ARGS];
+
+		getQueryParams(st, command, params);
+
+		if (debug)
+			fprintf(stderr, "client %d sending %s\n", st->id, sql);
+		r = PQsendQueryParams(st->con, sql, command->argc - 1,
+							  NULL, params, NULL, NULL, 0);
+	}
+	else if (querymode == QUERY_PREPARED)
+	{
+		char		name[MAX_PREPARE_NAME];
+		const char *params[MAX_ARGS];
+
+		if (!st->prepared[st->use_file])
+		{
+			int			j;
+			Command   **commands = sql_script[st->use_file].commands;
+
+			for (j = 0; commands[j] != NULL; j++)
+			{
+				PGresult   *res;
+				char		name[MAX_PREPARE_NAME];
+
+				if (commands[j]->type != SQL_COMMAND)
+					continue;
+				preparedStatementName(name, st->use_file, j);
+				res = PQprepare(st->con, name,
+						  commands[j]->argv[0], commands[j]->argc - 1, NULL);
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+					fprintf(stderr, "%s", PQerrorMessage(st->con));
+				PQclear(res);
+			}
+			st->prepared[st->use_file] = true;
+		}
+
+		getQueryParams(st, command, params);
+		preparedStatementName(name, st->use_file, st->command);
+
+		if (debug)
+			fprintf(stderr, "client %d sending %s\n", st->id, name);
+		r = PQsendQueryPrepared(st->con, name, command->argc - 1,
+								params, NULL, NULL, 0);
+	}
+	else	/* unknown sql mode */
+		r = 0;
+
+	if (r == 0)
+	{
+		if (debug)
+			fprintf(stderr, "client %d could not send %s\n",
+					st->id, command->argv[0]);
+		st->ecnt++;
+		return false;
+	}
+	else
+		return true;
+}
+
+/*
+ * Parse the argument to a \sleep command, and return the requested amount
+ * of delay, in microseconds.  Returns true on success, false on error.
+ */
+static bool
+evaluateSleep(CState *st, int argc, char **argv, int *usecs)
+{
+	char	   *var;
+	int			usec;
+
+	if (*argv[1] == ':')
+	{
+		if ((var = getVariable(st, argv[1] + 1)) == NULL)
+		{
+			fprintf(stderr, "%s: undefined variable \"%s\"\n",
+					argv[0], argv[1]);
+			return false;
+		}
+		usec = atoi(var);
+	}
+	else
+		usec = atoi(argv[1]);
+
+	if (argc > 2)
+	{
+		if (pg_strcasecmp(argv[2], "ms") == 0)
+			usec *= 1000;
+		else if (pg_strcasecmp(argv[2], "s") == 0)
+			usec *= 1000000;
+	}
+	else
+		usec *= 1000000;
+
+	*usecs = usec;
+	return true;
+}
+
+/*
+ * Advance the state machine of a connection, if possible.
+ */
+static void
 doCustom(TState *thread, CState *st, StatsData *agg)
 {
 	PGresult   *res;
-	Command   **commands;
-	bool		trans_needs_throttle = false;
+	Command    *command;
 	instr_time	now;
+	bool		end_tx_processed = false;
+	int64		wait;
 
 	/*
 	 * gettimeofday() isn't free, so we get the current timestamp lazily the
 	 * first time it's needed, and reuse the same value throughout this
-	 * function after that. This also ensures that e.g. the calculated latency
-	 * reported in the log file and in the totals are the same. Zero means
-	 * "not set yet". Reset "now" when we step to the next command with "goto
-	 * top", though.
+	 * function after that.  This also ensures that e.g. the calculated
+	 * latency reported in the log file and in the totals are the same. Zero
+	 * means "not set yet".  Reset "now" when we execute shell commands or
+	 * expressions, which might take a non-negligible amount of time, though.
 	 */
-top:
 	INSTR_TIME_SET_ZERO(now);
 
-	commands = sql_script[st->use_file].commands;
-
 	/*
-	 * Handle throttling once per transaction by sleeping.  It is simpler to
-	 * do this here rather than at the end, because so much complicated logic
-	 * happens below when statements finish.
+	 * Loop in the state machine, until we have to wait for a result from the
+	 * server (or have to sleep, for throttling or for \sleep).
+	 *
+	 * Note: In the switch-statement below, 'break' will loop back here,
+	 * meaning "continue in the state machine".  Return is used to return to
+	 * the caller.
 	 */
-	if (throttle_delay && !st->is_throttled)
+	for (;;)
 	{
-		/*
-		 * Generate a delay such that the series of delays will approximate a
-		 * Poisson distribution centered on the throttle_delay time.
-		 *
-		 * If transactions are too slow or a given wait is shorter than a
-		 * transaction, the next transaction will start right away.
-		 */
-		int64		wait = getPoissonRand(thread, throttle_delay);
-
-		thread->throttle_trigger += wait;
-		st->txn_scheduled = thread->throttle_trigger;
-
-		/* stop client if next transaction is beyond pgbench end of execution */
-		if (duration > 0 && st->txn_scheduled > end_time)
-			return clientDone(st);
-
-		/*
-		 * If this --latency-limit is used, and this slot is already late so
-		 * that the transaction will miss the latency limit even if it
-		 * completed immediately, we skip this time slot and iterate till the
-		 * next slot that isn't late yet.
-		 */
-		if (latency_limit)
+		switch (st->state)
 		{
-			int64		now_us;
+				/*
+				 * Select transaction to run.
+				 */
+			case CSTATE_CHOOSE_SCRIPT:
 
-			if (INSTR_TIME_IS_ZERO(now))
-				INSTR_TIME_SET_CURRENT(now);
-			now_us = INSTR_TIME_GET_MICROSEC(now);
-			while (thread->throttle_trigger < now_us - latency_limit)
-			{
-				processXactStats(thread, st, &now, true, agg);
-				/* next rendez-vous */
+				st->use_file = chooseScript(thread);
+
+				if (debug)
+					fprintf(stderr, "client %d executing script \"%s\"\n", st->id,
+							sql_script[st->use_file].desc);
+
+				if (throttle_delay > 0)
+					st->state = CSTATE_START_THROTTLE;
+				else
+					st->state = CSTATE_START_TX;
+				break;
+
+				/*
+				 * Handle throttling once per transaction by sleeping.
+				 */
+			case CSTATE_START_THROTTLE:
+
+				/*
+				 * Generate a delay such that the series of delays will
+				 * approximate a Poisson distribution centered on the
+				 * throttle_delay time.
+				 *
+				 * If transactions are too slow or a given wait is shorter
+				 * than a transaction, the next transaction will start right
+				 * away.
+				 */
+				Assert(throttle_delay > 0);
 				wait = getPoissonRand(thread, throttle_delay);
+
 				thread->throttle_trigger += wait;
 				st->txn_scheduled = thread->throttle_trigger;
-			}
-		}
 
-		st->sleeping = true;
-		st->throttling = true;
-		st->is_throttled = true;
-		if (debug)
-			fprintf(stderr, "client %d throttling " INT64_FORMAT " us\n",
-					st->id, wait);
-	}
-
-	if (st->sleeping)
-	{							/* are we sleeping? */
-		if (INSTR_TIME_IS_ZERO(now))
-			INSTR_TIME_SET_CURRENT(now);
-		if (INSTR_TIME_GET_MICROSEC(now) < st->txn_scheduled)
-			return true;		/* Still sleeping, nothing to do here */
-		/* Else done sleeping, go ahead with next command */
-		st->sleeping = false;
-		st->throttling = false;
-	}
-
-	if (st->listen)
-	{							/* are we receiver? */
-		if (commands[st->state]->type == SQL_COMMAND)
-		{
-			if (debug)
-				fprintf(stderr, "client %d receiving\n", st->id);
-			if (!PQconsumeInput(st->con))
-			{					/* there's something wrong */
-				fprintf(stderr, "client %d aborted in state %d; perhaps the backend died while processing\n", st->id, st->state);
-				return clientDone(st);
-			}
-			if (PQisBusy(st->con))
-				return true;	/* don't have the whole result yet */
-		}
-
-		/*
-		 * command finished: accumulate per-command execution times in
-		 * thread-local data structure, if per-command latencies are requested
-		 */
-		if (is_latencies)
-		{
-			if (INSTR_TIME_IS_ZERO(now))
-				INSTR_TIME_SET_CURRENT(now);
-
-			/* XXX could use a mutex here, but we choose not to */
-			addToSimpleStats(&commands[st->state]->stats,
-							 INSTR_TIME_GET_DOUBLE(now) -
-							 INSTR_TIME_GET_DOUBLE(st->stmt_begin));
-		}
-
-		/* transaction finished: calculate latency and log the transaction */
-		if (commands[st->state + 1] == NULL)
-		{
-			if (progress || throttle_delay || latency_limit ||
-				per_script_stats || use_log)
-				processXactStats(thread, st, &now, false, agg);
-			else
-				thread->stats.cnt++;
-		}
-
-		if (commands[st->state]->type == SQL_COMMAND)
-		{
-			/*
-			 * Read and discard the query result; note this is not included in
-			 * the statement latency numbers.
-			 */
-			res = PQgetResult(st->con);
-			switch (PQresultStatus(res))
-			{
-				case PGRES_COMMAND_OK:
-				case PGRES_TUPLES_OK:
-					break;		/* OK */
-				default:
-					fprintf(stderr, "client %d aborted in state %d: %s",
-							st->id, st->state, PQerrorMessage(st->con));
-					PQclear(res);
-					return clientDone(st);
-			}
-			PQclear(res);
-			discard_response(st);
-		}
-
-		if (commands[st->state + 1] == NULL)
-		{
-			if (is_connect)
-			{
-				PQfinish(st->con);
-				st->con = NULL;
-			}
-
-			++st->cnt;
-			if ((st->cnt >= nxacts && duration <= 0) || timer_exceeded)
-				return clientDone(st);	/* exit success */
-		}
-
-		/* increment state counter */
-		st->state++;
-		if (commands[st->state] == NULL)
-		{
-			st->state = 0;
-			st->use_file = chooseScript(thread);
-			commands = sql_script[st->use_file].commands;
-			if (debug)
-				fprintf(stderr, "client %d executing script \"%s\"\n", st->id,
-						sql_script[st->use_file].desc);
-			st->is_throttled = false;
-
-			/*
-			 * No transaction is underway anymore, which means there is
-			 * nothing to listen to right now.  When throttling rate limits
-			 * are active, a sleep will happen next, as the next transaction
-			 * starts.  And then in any case the next SQL command will set
-			 * listen back to true.
-			 */
-			st->listen = false;
-			trans_needs_throttle = (throttle_delay > 0);
-		}
-	}
-
-	if (st->con == NULL)
-	{
-		instr_time	start,
-					end;
-
-		INSTR_TIME_SET_CURRENT(start);
-		if ((st->con = doConnect()) == NULL)
-		{
-			fprintf(stderr, "client %d aborted while establishing connection\n",
-					st->id);
-			return clientDone(st);
-		}
-		INSTR_TIME_SET_CURRENT(end);
-		INSTR_TIME_ACCUM_DIFF(thread->conn_time, end, start);
-
-		/* Reset session-local state */
-		st->listen = false;
-		st->sleeping = false;
-		st->throttling = false;
-		st->is_throttled = false;
-		memset(st->prepared, 0, sizeof(st->prepared));
-	}
-
-	/*
-	 * This ensures that a throttling delay is inserted before proceeding with
-	 * sql commands, after the first transaction. The first transaction
-	 * throttling is performed when first entering doCustom.
-	 */
-	if (trans_needs_throttle)
-	{
-		trans_needs_throttle = false;
-		goto top;
-	}
-
-	/* Record transaction start time under logging, progress or throttling */
-	if ((use_log || progress || throttle_delay || latency_limit ||
-		 per_script_stats) && st->state == 0)
-	{
-		INSTR_TIME_SET_CURRENT(st->txn_begin);
-
-		/*
-		 * When not throttling, this is also the transaction's scheduled start
-		 * time.
-		 */
-		if (!throttle_delay)
-			st->txn_scheduled = INSTR_TIME_GET_MICROSEC(st->txn_begin);
-	}
-
-	/* Record statement start time if per-command latencies are requested */
-	if (is_latencies)
-		INSTR_TIME_SET_CURRENT(st->stmt_begin);
-
-	if (commands[st->state]->type == SQL_COMMAND)
-	{
-		const Command *command = commands[st->state];
-		int			r;
-
-		if (querymode == QUERY_SIMPLE)
-		{
-			char	   *sql;
-
-			sql = pg_strdup(command->argv[0]);
-			sql = assignVariables(st, sql);
-
-			if (debug)
-				fprintf(stderr, "client %d sending %s\n", st->id, sql);
-			r = PQsendQuery(st->con, sql);
-			free(sql);
-		}
-		else if (querymode == QUERY_EXTENDED)
-		{
-			const char *sql = command->argv[0];
-			const char *params[MAX_ARGS];
-
-			getQueryParams(st, command, params);
-
-			if (debug)
-				fprintf(stderr, "client %d sending %s\n", st->id, sql);
-			r = PQsendQueryParams(st->con, sql, command->argc - 1,
-								  NULL, params, NULL, NULL, 0);
-		}
-		else if (querymode == QUERY_PREPARED)
-		{
-			char		name[MAX_PREPARE_NAME];
-			const char *params[MAX_ARGS];
-
-			if (!st->prepared[st->use_file])
-			{
-				int			j;
-
-				for (j = 0; commands[j] != NULL; j++)
+				/*
+				 * stop client if next transaction is beyond pgbench end of
+				 * execution
+				 */
+				if (duration > 0 && st->txn_scheduled > end_time)
 				{
-					PGresult   *res;
-					char		name[MAX_PREPARE_NAME];
-
-					if (commands[j]->type != SQL_COMMAND)
-						continue;
-					preparedStatementName(name, st->use_file, j);
-					res = PQprepare(st->con, name,
-						  commands[j]->argv[0], commands[j]->argc - 1, NULL);
-					if (PQresultStatus(res) != PGRES_COMMAND_OK)
-						fprintf(stderr, "%s", PQerrorMessage(st->con));
-					PQclear(res);
+					st->state = CSTATE_FINISHED;
+					break;
 				}
-				st->prepared[st->use_file] = true;
-			}
 
-			getQueryParams(st, command, params);
-			preparedStatementName(name, st->use_file, st->state);
-
-			if (debug)
-				fprintf(stderr, "client %d sending %s\n", st->id, name);
-			r = PQsendQueryPrepared(st->con, name, command->argc - 1,
-									params, NULL, NULL, 0);
-		}
-		else	/* unknown sql mode */
-			r = 0;
-
-		if (r == 0)
-		{
-			if (debug)
-				fprintf(stderr, "client %d could not send %s\n",
-						st->id, command->argv[0]);
-			st->ecnt++;
-		}
-		else
-			st->listen = true;	/* flags that should be listened */
-	}
-	else if (commands[st->state]->type == META_COMMAND)
-	{
-		int			argc = commands[st->state]->argc,
-					i;
-		char	  **argv = commands[st->state]->argv;
-
-		if (debug)
-		{
-			fprintf(stderr, "client %d executing \\%s", st->id, argv[0]);
-			for (i = 1; i < argc; i++)
-				fprintf(stderr, " %s", argv[i]);
-			fprintf(stderr, "\n");
-		}
-
-		if (pg_strcasecmp(argv[0], "set") == 0)
-		{
-			char		res[64];
-			PgBenchExpr *expr = commands[st->state]->expr;
-			PgBenchValue	result;
-
-			if (!evaluateExpr(thread, st, expr, &result))
-			{
-				st->ecnt++;
-				return true;
-			}
-
-			if (result.type == PGBT_INT)
-				sprintf(res, INT64_FORMAT, result.u.ival);
-			else
-			{
-				Assert(result.type == PGBT_DOUBLE);
-				sprintf(res, "%.18e", result.u.dval);
-			}
-
-			if (!putVariable(st, argv[0], argv[1], res))
-			{
-				st->ecnt++;
-				return true;
-			}
-
-			st->listen = true;
-		}
-		else if (pg_strcasecmp(argv[0], "sleep") == 0)
-		{
-			char	   *var;
-			int			usec;
-			instr_time	now;
-
-			if (*argv[1] == ':')
-			{
-				if ((var = getVariable(st, argv[1] + 1)) == NULL)
+				/*
+				 * If this --latency-limit is used, and this slot is already
+				 * late so that the transaction will miss the latency limit
+				 * even if it completed immediately, we skip this time slot
+				 * and iterate till the next slot that isn't late yet.
+				 */
+				if (latency_limit)
 				{
-					fprintf(stderr, "%s: undefined variable \"%s\"\n",
-							argv[0], argv[1]);
-					st->ecnt++;
-					return true;
+					int64		now_us;
+
+					if (INSTR_TIME_IS_ZERO(now))
+						INSTR_TIME_SET_CURRENT(now);
+					now_us = INSTR_TIME_GET_MICROSEC(now);
+					while (thread->throttle_trigger < now_us - latency_limit)
+					{
+						processXactStats(thread, st, &now, true, agg);
+						/* next rendez-vous */
+						wait = getPoissonRand(thread, throttle_delay);
+						thread->throttle_trigger += wait;
+						st->txn_scheduled = thread->throttle_trigger;
+					}
 				}
-				usec = atoi(var);
-			}
-			else
-				usec = atoi(argv[1]);
 
-			if (argc > 2)
-			{
-				if (pg_strcasecmp(argv[2], "ms") == 0)
-					usec *= 1000;
-				else if (pg_strcasecmp(argv[2], "s") == 0)
-					usec *= 1000000;
-			}
-			else
-				usec *= 1000000;
+				st->state = CSTATE_THROTTLE;
+				if (debug)
+					fprintf(stderr, "client %d throttling " INT64_FORMAT " us\n",
+							st->id, wait);
+				break;
 
-			INSTR_TIME_SET_CURRENT(now);
-			st->txn_scheduled = INSTR_TIME_GET_MICROSEC(now) + usec;
-			st->sleeping = true;
+				/*
+				 * Wait until it's time to start next transaction.
+				 */
+			case CSTATE_THROTTLE:
+				if (INSTR_TIME_IS_ZERO(now))
+					INSTR_TIME_SET_CURRENT(now);
+				if (INSTR_TIME_GET_MICROSEC(now) < st->txn_scheduled)
+					return;		/* Still sleeping, nothing to do here */
 
-			st->listen = true;
+				/* Else done sleeping, start the transaction */
+				st->state = CSTATE_START_TX;
+				break;
+
+				/* Start new transaction */
+			case CSTATE_START_TX:
+
+				/*
+				 * Establish connection on first call, or if is_connect is
+				 * true.
+				 */
+				if (st->con == NULL)
+				{
+					instr_time	start;
+
+					if (INSTR_TIME_IS_ZERO(now))
+						INSTR_TIME_SET_CURRENT(now);
+					start = now;
+					if ((st->con = doConnect()) == NULL)
+					{
+						fprintf(stderr, "client %d aborted while establishing connection\n",
+								st->id);
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+					INSTR_TIME_SET_CURRENT(now);
+					INSTR_TIME_ACCUM_DIFF(thread->conn_time, now, start);
+
+					/* Reset session-local state */
+					memset(st->prepared, 0, sizeof(st->prepared));
+				}
+
+				/*
+				 * Record transaction start time under logging, progress or
+				 * throttling.
+				 */
+				if (use_log || progress || throttle_delay || latency_limit ||
+					per_script_stats)
+				{
+					if (INSTR_TIME_IS_ZERO(now))
+						INSTR_TIME_SET_CURRENT(now);
+					st->txn_begin = now;
+
+					/*
+					 * When not throttling, this is also the transaction's
+					 * scheduled start time.
+					 */
+					if (!throttle_delay)
+						st->txn_scheduled = INSTR_TIME_GET_MICROSEC(now);
+				}
+
+				/* Begin with the first command */
+				st->command = 0;
+				st->state = CSTATE_START_COMMAND;
+				break;
+
+				/*
+				 * Send a command to server (or execute a meta-command)
+				 */
+			case CSTATE_START_COMMAND:
+				command = sql_script[st->use_file].commands[st->command];
+
+				/*
+				 * If we reached the end of the script, move to end-of-xact
+				 * processing.
+				 */
+				if (command == NULL)
+				{
+					st->state = CSTATE_END_TX;
+					break;
+				}
+
+				/*
+				 * Record statement start time if per-command latencies are
+				 * requested
+				 */
+				if (is_latencies)
+				{
+					if (INSTR_TIME_IS_ZERO(now))
+						INSTR_TIME_SET_CURRENT(now);
+					st->stmt_begin = now;
+				}
+
+				if (command->type == SQL_COMMAND)
+				{
+					if (!sendCommand(st, command))
+					{
+						/*
+						 * Failed. Stay in CSTATE_START_COMMAND state, to
+						 * retry. ??? What the point or retrying? Should
+						 * rather abort?
+						 */
+						return;
+					}
+					else
+						st->state = CSTATE_WAIT_RESULT;
+				}
+				else if (command->type == META_COMMAND)
+				{
+					int			argc = command->argc,
+								i;
+					char	  **argv = command->argv;
+
+					if (debug)
+					{
+						fprintf(stderr, "client %d executing \\%s", st->id, argv[0]);
+						for (i = 1; i < argc; i++)
+							fprintf(stderr, " %s", argv[i]);
+						fprintf(stderr, "\n");
+					}
+
+					if (pg_strcasecmp(argv[0], "sleep") == 0)
+					{
+						/*
+						 * A \sleep doesn't execute anything, we just get the
+						 * delay from the argument, and enter the CSTATE_SLEEP
+						 * state.  (The per-command latency will be recorded
+						 * in CSTATE_SLEEP state, not here, after the delay
+						 * has elapsed.)
+						 */
+						int			usec;
+
+						if (!evaluateSleep(st, argc, argv, &usec))
+						{
+							commandFailed(st, "execution of meta-command 'sleep' failed");
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+
+						if (INSTR_TIME_IS_ZERO(now))
+							INSTR_TIME_SET_CURRENT(now);
+						st->sleep_until = INSTR_TIME_GET_MICROSEC(now) + usec;
+						st->state = CSTATE_SLEEP;
+						break;
+					}
+					else
+					{
+						if (pg_strcasecmp(argv[0], "set") == 0)
+						{
+							PgBenchExpr *expr = command->expr;
+							PgBenchValue result;
+
+							if (!evaluateExpr(thread, st, expr, &result))
+							{
+								commandFailed(st, "evaluation of meta-command 'set' failed");
+								st->state = CSTATE_ABORTED;
+								break;
+							}
+
+							if (!putVariableNumber(st, argv[0], argv[1], &result))
+							{
+								commandFailed(st, "assignment of meta-command 'set' failed");
+								st->state = CSTATE_ABORTED;
+								break;
+							}
+						}
+						else if (pg_strcasecmp(argv[0], "setshell") == 0)
+						{
+							bool		ret = runShellCommand(st, argv[1], argv + 2, argc - 2);
+
+							if (timer_exceeded) /* timeout */
+							{
+								st->state = CSTATE_FINISHED;
+								break;
+							}
+							else if (!ret)		/* on error */
+							{
+								commandFailed(st, "execution of meta-command 'setshell' failed");
+								st->state = CSTATE_ABORTED;
+								break;
+							}
+							else
+							{
+								/* succeeded */
+							}
+						}
+						else if (pg_strcasecmp(argv[0], "shell") == 0)
+						{
+							bool		ret = runShellCommand(st, NULL, argv + 1, argc - 1);
+
+							if (timer_exceeded) /* timeout */
+							{
+								st->state = CSTATE_FINISHED;
+								break;
+							}
+							else if (!ret)		/* on error */
+							{
+								commandFailed(st, "execution of meta-command 'shell' failed");
+								st->state = CSTATE_ABORTED;
+								break;
+							}
+							else
+							{
+								/* succeeded */
+							}
+						}
+
+						/*
+						 * executing the expression or shell command might
+						 * take a non-negligible amount of time, so reset
+						 * 'now'
+						 */
+						INSTR_TIME_SET_ZERO(now);
+
+						st->state = CSTATE_END_COMMAND;
+					}
+				}
+				break;
+
+				/*
+				 * Wait for the current SQL command to complete
+				 */
+			case CSTATE_WAIT_RESULT:
+				command = sql_script[st->use_file].commands[st->command];
+				if (debug)
+					fprintf(stderr, "client %d receiving\n", st->id);
+				if (!PQconsumeInput(st->con))
+				{				/* there's something wrong */
+					commandFailed(st, "perhaps the backend died while processing");
+					st->state = CSTATE_ABORTED;
+					break;
+				}
+				if (PQisBusy(st->con))
+					return;		/* don't have the whole result yet */
+
+				/*
+				 * Read and discard the query result;
+				 */
+				res = PQgetResult(st->con);
+				switch (PQresultStatus(res))
+				{
+					case PGRES_COMMAND_OK:
+					case PGRES_TUPLES_OK:
+					case PGRES_EMPTY_QUERY:
+						/* OK */
+						PQclear(res);
+						discard_response(st);
+						st->state = CSTATE_END_COMMAND;
+						break;
+					default:
+						commandFailed(st, PQerrorMessage(st->con));
+						PQclear(res);
+						st->state = CSTATE_ABORTED;
+						break;
+				}
+				break;
+
+				/*
+				 * Wait until sleep is done. This state is entered after a
+				 * \sleep metacommand. The behavior is similar to
+				 * CSTATE_THROTTLE, but proceeds to CSTATE_START_COMMAND
+				 * instead of CSTATE_START_TX.
+				 */
+			case CSTATE_SLEEP:
+				if (INSTR_TIME_IS_ZERO(now))
+					INSTR_TIME_SET_CURRENT(now);
+				if (INSTR_TIME_GET_MICROSEC(now) < st->sleep_until)
+					return;		/* Still sleeping, nothing to do here */
+				/* Else done sleeping. */
+				st->state = CSTATE_END_COMMAND;
+				break;
+
+				/*
+				 * End of command: record stats and proceed to next command.
+				 */
+			case CSTATE_END_COMMAND:
+
+				/*
+				 * command completed: accumulate per-command execution times
+				 * in thread-local data structure, if per-command latencies
+				 * are requested.
+				 */
+				if (is_latencies)
+				{
+					if (INSTR_TIME_IS_ZERO(now))
+						INSTR_TIME_SET_CURRENT(now);
+
+					/* XXX could use a mutex here, but we choose not to */
+					command = sql_script[st->use_file].commands[st->command];
+					addToSimpleStats(&command->stats,
+									 INSTR_TIME_GET_DOUBLE(now) -
+									 INSTR_TIME_GET_DOUBLE(st->stmt_begin));
+				}
+
+				/* Go ahead with next command */
+				st->command++;
+				st->state = CSTATE_START_COMMAND;
+				break;
+
+				/*
+				 * End of transaction.
+				 */
+			case CSTATE_END_TX:
+
+				/*
+				 * transaction finished: calculate latency and log the
+				 * transaction
+				 */
+				if (progress || throttle_delay || latency_limit ||
+					per_script_stats || use_log)
+					processXactStats(thread, st, &now, false, agg);
+				else
+					thread->stats.cnt++;
+
+				if (is_connect)
+				{
+					PQfinish(st->con);
+					st->con = NULL;
+					INSTR_TIME_SET_ZERO(now);
+				}
+
+				++st->cnt;
+				if ((st->cnt >= nxacts && duration <= 0) || timer_exceeded)
+				{
+					/* exit success */
+					st->state = CSTATE_FINISHED;
+					break;
+				}
+
+				/*
+				 * No transaction is underway anymore.
+				 */
+				st->state = CSTATE_CHOOSE_SCRIPT;
+
+				/*
+				 * If we paced through all commands in the script in this
+				 * loop, without returning to the caller even once, do it now.
+				 * This gives the thread a chance to process other
+				 * connections, and to do progress reporting.  This can
+				 * currently only happen if the script consists entirely of
+				 * meta-commands.
+				 */
+				if (end_tx_processed)
+					return;
+				else
+				{
+					end_tx_processed = true;
+					break;
+				}
+
+				/*
+				 * Final states.  Close the connection if it's still open.
+				 */
+			case CSTATE_ABORTED:
+			case CSTATE_FINISHED:
+				if (st->con != NULL)
+				{
+					PQfinish(st->con);
+					st->con = NULL;
+				}
+				return;
 		}
-		else if (pg_strcasecmp(argv[0], "setshell") == 0)
-		{
-			bool		ret = runShellCommand(st, argv[1], argv + 2, argc - 2);
-
-			if (timer_exceeded) /* timeout */
-				return clientDone(st);
-			else if (!ret)		/* on error */
-			{
-				st->ecnt++;
-				return true;
-			}
-			else	/* succeeded */
-				st->listen = true;
-		}
-		else if (pg_strcasecmp(argv[0], "shell") == 0)
-		{
-			bool		ret = runShellCommand(st, NULL, argv + 1, argc - 1);
-
-			if (timer_exceeded) /* timeout */
-				return clientDone(st);
-			else if (!ret)		/* on error */
-			{
-				st->ecnt++;
-				return true;
-			}
-			else	/* succeeded */
-				st->listen = true;
-		}
-
-		/* after a meta command, immediately proceed with next command */
-		goto top;
 	}
-
-	return true;
 }
 
 /*
@@ -2046,7 +2428,7 @@ static void
 doLog(TState *thread, CState *st, instr_time *now,
 	  StatsData *agg, bool skipped, double latency, double lag)
 {
-	FILE   *logfile = thread->logfile;
+	FILE	   *logfile = thread->logfile;
 
 	Assert(use_log);
 
@@ -3115,6 +3497,7 @@ printResults(TState *threads, StatsData *total, instr_time total_time,
 	tps_exclude = total->cnt / (time_include -
 						(INSTR_TIME_GET_DOUBLE(conn_total_time) / nclients));
 
+	/* Report test parameters. */
 	printf("transaction type: %s\n",
 		   num_scripts == 1 ? sql_script[0].desc : "multiple scripts");
 	printf("scaling factor: %d\n", scale);
@@ -3151,9 +3534,11 @@ printResults(TState *threads, StatsData *total, instr_time total_time,
 	if (throttle_delay || progress || latency_limit)
 		printSimpleStats("latency", &total->latency);
 	else
-		/* only an average latency computed from the duration is available */
-		printf("latency average: %.3f ms\n",
-			   1000.0 * duration * nclients / total->cnt);
+	{
+		/* no measurement, show average latency computed from run time */
+		printf("latency average = %.3f ms\n",
+			   1000.0 * time_include * nclients / total->cnt);
+	}
 
 	if (throttle_delay)
 	{
@@ -3179,7 +3564,7 @@ printResults(TState *threads, StatsData *total, instr_time total_time,
 		{
 			if (num_scripts > 1)
 				printf("SQL script %d: %s\n"
-					   " - weight = %d (targets %.1f%% of total)\n"
+					   " - weight: %d (targets %.1f%% of total)\n"
 					   " - " INT64_FORMAT " transactions (%.1f%% of total, tps = %f)\n",
 					   i + 1, sql_script[i].desc,
 					   sql_script[i].weight,
@@ -3292,8 +3677,6 @@ main(int argc, char **argv)
 	PGconn	   *con;
 	PGresult   *res;
 	char	   *env;
-
-	char		val[64];
 
 	progname = get_progname(argv[0]);
 
@@ -3735,8 +4118,20 @@ main(int argc, char **argv)
 			state[i].id = i;
 			for (j = 0; j < state[0].nvariables; j++)
 			{
-				if (!putVariable(&state[i], "startup", state[0].variables[j].name, state[0].variables[j].value))
-					exit(1);
+				Variable   *var = &state[0].variables[j];
+
+				if (var->is_numeric)
+				{
+					if (!putVariableNumber(&state[i], "startup",
+										   var->name, &var->num_value))
+						exit(1);
+				}
+				else
+				{
+					if (!putVariable(&state[i], "startup",
+									 var->name, var->value))
+						exit(1);
+				}
 			}
 		}
 	}
@@ -3802,12 +4197,11 @@ main(int argc, char **argv)
 	 * :scale variables normally get -s or database scale, but don't override
 	 * an explicit -D switch
 	 */
-	if (getVariable(&state[0], "scale") == NULL)
+	if (lookupVariable(&state[0], "scale") == NULL)
 	{
-		snprintf(val, sizeof(val), "%d", scale);
 		for (i = 0; i < nclients; i++)
 		{
-			if (!putVariable(&state[i], "startup", "scale", val))
+			if (!putVariableInt(&state[i], "startup", "scale", scale))
 				exit(1);
 		}
 	}
@@ -3816,12 +4210,11 @@ main(int argc, char **argv)
 	 * Define a :client_id variable that is unique per connection. But don't
 	 * override an explicit -D switch.
 	 */
-	if (getVariable(&state[0], "client_id") == NULL)
+	if (lookupVariable(&state[0], "client_id") == NULL)
 	{
 		for (i = 0; i < nclients; i++)
 		{
-			snprintf(val, sizeof(val), "%d", i);
-			if (!putVariable(&state[i], "startup", "client_id", val))
+			if (!putVariableInt(&state[i], "startup", "client_id", i))
 				exit(1);
 		}
 	}
@@ -3862,7 +4255,7 @@ main(int argc, char **argv)
 		thread->random_state[0] = random();
 		thread->random_state[1] = random();
 		thread->random_state[2] = random();
-		thread->logfile = NULL;		/* filled in later */
+		thread->logfile = NULL; /* filled in later */
 		thread->latency_late = 0;
 		initStats(&thread->stats, 0.0);
 
@@ -3890,7 +4283,7 @@ main(int argc, char **argv)
 		/* compute when to stop */
 		if (duration > 0)
 			end_time = INSTR_TIME_GET_MICROSEC(thread->start_time) +
-				(int64) 1000000 * duration;
+				(int64) 1000000 *duration;
 
 		/* the first thread (i = 0) is executed by main thread */
 		if (i > 0)
@@ -3913,7 +4306,7 @@ main(int argc, char **argv)
 	/* compute when to stop */
 	if (duration > 0)
 		end_time = INSTR_TIME_GET_MICROSEC(threads[0].start_time) +
-			(int64) 1000000 * duration;
+			(int64) 1000000 *duration;
 	threads[0].thread = INVALID_THREAD;
 #endif   /* ENABLE_THREAD_SAFETY */
 
@@ -4027,98 +4420,85 @@ threadRun(void *arg)
 	initStats(&aggs, INSTR_TIME_GET_DOUBLE(thread->start_time));
 	last = aggs;
 
-	/* send start up queries in async manner */
+	/* explicitly initialize the state machines */
 	for (i = 0; i < nstate; i++)
 	{
-		CState	   *st = &state[i];
-		int			prev_ecnt = st->ecnt;
-		Command   **commands;
-
-		st->use_file = chooseScript(thread);
-		commands = sql_script[st->use_file].commands;
-		if (debug)
-			fprintf(stderr, "client %d executing script \"%s\"\n", st->id,
-					sql_script[st->use_file].desc);
-		if (!doCustom(thread, st, &aggs))
-			remains--;			/* I've aborted */
-
-		if (st->ecnt > prev_ecnt && commands[st->state]->type == META_COMMAND)
-		{
-			fprintf(stderr, "client %d aborted in state %d; execution of meta-command failed\n",
-					i, st->state);
-			remains--;			/* I've aborted */
-			PQfinish(st->con);
-			st->con = NULL;
-		}
+		state[i].state = CSTATE_CHOOSE_SCRIPT;
 	}
 
+	/* loop till all clients have terminated */
 	while (remains > 0)
 	{
 		fd_set		input_mask;
-		int			maxsock;	/* max socket number to be waited */
-		int64		now_usec = 0;
+		int			maxsock;	/* max socket number to be waited for */
 		int64		min_usec;
+		int64		now_usec = 0;		/* set this only if needed */
 
+		/* identify which client sockets should be checked for input */
 		FD_ZERO(&input_mask);
-
 		maxsock = -1;
 		min_usec = PG_INT64_MAX;
 		for (i = 0; i < nstate; i++)
 		{
 			CState	   *st = &state[i];
-			Command   **commands = sql_script[st->use_file].commands;
-			int			sock;
 
-			if (st->con == NULL)
+			if (st->state == CSTATE_THROTTLE && timer_exceeded)
 			{
-				continue;
+				/* interrupt client that has not started a transaction */
+				st->state = CSTATE_FINISHED;
+				PQfinish(st->con);
+				st->con = NULL;
+				remains--;
 			}
-			else if (st->sleeping)
+			else if (st->state == CSTATE_SLEEP || st->state == CSTATE_THROTTLE)
 			{
-				if (st->throttling && timer_exceeded)
+				/* a nap from the script, or under throttling */
+				int64		this_usec;
+
+				/* get current time if needed */
+				if (now_usec == 0)
 				{
-					/* interrupt client which has not started a transaction */
-					remains--;
-					st->sleeping = false;
-					st->throttling = false;
-					PQfinish(st->con);
-					st->con = NULL;
-					continue;
+					instr_time	now;
+
+					INSTR_TIME_SET_CURRENT(now);
+					now_usec = INSTR_TIME_GET_MICROSEC(now);
 				}
-				else	/* just a nap from the script */
-				{
-					int			this_usec;
 
-					if (min_usec == PG_INT64_MAX)
-					{
-						instr_time	now;
-
-						INSTR_TIME_SET_CURRENT(now);
-						now_usec = INSTR_TIME_GET_MICROSEC(now);
-					}
-
-					this_usec = st->txn_scheduled - now_usec;
-					if (min_usec > this_usec)
-						min_usec = this_usec;
-				}
+				/* min_usec should be the minimum delay across all clients */
+				this_usec = (st->state == CSTATE_SLEEP ?
+							 st->sleep_until : st->txn_scheduled) - now_usec;
+				if (min_usec > this_usec)
+					min_usec = this_usec;
 			}
-			else if (commands[st->state]->type == META_COMMAND)
+			else if (st->state == CSTATE_WAIT_RESULT)
 			{
-				min_usec = 0;	/* the connection is ready to run */
+				/*
+				 * waiting for result from server - nothing to do unless the
+				 * socket is readable
+				 */
+				int			sock = PQsocket(st->con);
+
+				if (sock < 0)
+				{
+					fprintf(stderr, "invalid socket: %s",
+							PQerrorMessage(st->con));
+					goto done;
+				}
+
+				FD_SET(sock, &input_mask);
+				if (maxsock < sock)
+					maxsock = sock;
+			}
+			else if (st->state != CSTATE_ABORTED &&
+					 st->state != CSTATE_FINISHED)
+			{
+				/*
+				 * This client thread is ready to do something, so we don't
+				 * want to wait.  No need to examine additional clients.
+				 */
+				min_usec = 0;
 				break;
 			}
-
-			sock = PQsocket(st->con);
-			if (sock < 0)
-			{
-				fprintf(stderr, "invalid socket: %s", PQerrorMessage(st->con));
-				goto done;
-			}
-
-			FD_SET(sock, &input_mask);
-
-			if (maxsock < sock)
-				maxsock = sock;
 		}
 
 		/* also wake up to print the next progress report on time */
@@ -4140,9 +4520,10 @@ threadRun(void *arg)
 		}
 
 		/*
-		 * Sleep until we receive data from the server, or a nap-time
-		 * specified in the script ends, or it's time to print a progress
-		 * report.
+		 * If no clients are ready to execute actions, sleep until we receive
+		 * data from the server, or a nap-time specified in the script ends,
+		 * or it's time to print a progress report.  Update input_mask to show
+		 * which client(s) received data.
 		 */
 		if (min_usec > 0 && maxsock != -1)
 		{
@@ -4161,22 +4542,29 @@ threadRun(void *arg)
 			if (nsocks < 0)
 			{
 				if (errno == EINTR)
+				{
+					/* On EINTR, go back to top of loop */
 					continue;
+				}
 				/* must be something wrong */
 				fprintf(stderr, "select() failed: %s\n", strerror(errno));
 				goto done;
 			}
 		}
+		else
+		{
+			/* If we didn't call select(), don't try to read any data */
+			FD_ZERO(&input_mask);
+		}
 
-		/* ok, backend returns reply */
+		/* ok, advance the state machine of each connection */
 		for (i = 0; i < nstate; i++)
 		{
 			CState	   *st = &state[i];
-			Command   **commands = sql_script[st->use_file].commands;
-			int			prev_ecnt = st->ecnt;
 
-			if (st->con)
+			if (st->state == CSTATE_WAIT_RESULT)
 			{
+				/* don't call doCustom unless data is available */
 				int			sock = PQsocket(st->con);
 
 				if (sock < 0)
@@ -4185,25 +4573,25 @@ threadRun(void *arg)
 							PQerrorMessage(st->con));
 					goto done;
 				}
-				if (FD_ISSET(sock, &input_mask) ||
-					commands[st->state]->type == META_COMMAND)
-				{
-					if (!doCustom(thread, st, &aggs))
-						remains--;		/* I've aborted */
-				}
+
+				if (!FD_ISSET(sock, &input_mask))
+					continue;
+			}
+			else if (st->state == CSTATE_FINISHED ||
+					 st->state == CSTATE_ABORTED)
+			{
+				/* this client is done, no need to consider it anymore */
+				continue;
 			}
 
-			if (st->ecnt > prev_ecnt && commands[st->state]->type == META_COMMAND)
-			{
-				fprintf(stderr, "client %d aborted in state %d; execution of meta-command failed\n",
-						i, st->state);
-				remains--;		/* I've aborted */
-				PQfinish(st->con);
-				st->con = NULL;
-			}
+			doCustom(thread, st, &aggs);
+
+			/* If doCustom changed client to finished state, reduce remains */
+			if (st->state == CSTATE_FINISHED || st->state == CSTATE_ABORTED)
+				remains--;
 		}
 
-		/* progress report by thread 0 for all threads */
+		/* progress report is made by thread 0 for all threads */
 		if (progress && thread->tid == 0)
 		{
 			instr_time	now_time;

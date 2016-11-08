@@ -52,6 +52,22 @@
  * do. Otherwise, if someone sets the latch between the check and the
  * ResetLatch call, you will miss it and Wait will incorrectly block.
  *
+ * Another valid coding pattern looks like:
+ *
+ * for (;;)
+ * {
+ *	   if (work to do)
+ *		   Do Stuff(); // in particular, exit loop if some condition satisfied
+ *	   WaitLatch();
+ *	   ResetLatch();
+ * }
+ *
+ * This is useful to reduce latch traffic if it's expected that the loop's
+ * termination condition will often be satisfied in the first iteration;
+ * the cost is an extra loop iteration before blocking when it is not.
+ * What must be avoided is placing any checks for asynchronous events after
+ * WaitLatch and before ResetLatch, as that creates a race condition.
+ *
  * To wake up the waiter, you must first set a global flag or something
  * else that the wait loop tests in the "if (work to do)" part, and call
  * SetLatch *after* that. SetLatch is designed to return quickly if the
@@ -139,10 +155,13 @@ extern int AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd,
 				  Latch *latch, void *user_data);
 extern void ModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch);
 
-extern int	WaitEventSetWait(WaitEventSet *set, long timeout, WaitEvent *occurred_events, int nevents);
-extern int	WaitLatch(volatile Latch *latch, int wakeEvents, long timeout);
+extern int WaitEventSetWait(WaitEventSet *set, long timeout,
+				 WaitEvent *occurred_events, int nevents,
+				 uint32 wait_event_info);
+extern int WaitLatch(volatile Latch *latch, int wakeEvents, long timeout,
+		  uint32 wait_event_info);
 extern int WaitLatchOrSocket(volatile Latch *latch, int wakeEvents,
-				  pgsocket sock, long timeout);
+				  pgsocket sock, long timeout, uint32 wait_event_info);
 
 /*
  * Unix implementation uses SIGUSR1 for inter-process signaling.

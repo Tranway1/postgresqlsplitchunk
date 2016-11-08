@@ -137,15 +137,16 @@ extern char *output_files[];
  */
 typedef struct
 {
-	/* Can't use NAMEDATALEN;  not guaranteed to fit on client */
+	/* Can't use NAMEDATALEN; not guaranteed to be same on client */
 	char	   *nspname;		/* namespace name */
 	char	   *relname;		/* relation name */
-	Oid			reloid;			/* relation oid */
+	Oid			reloid;			/* relation OID */
 	Oid			relfilenode;	/* relation relfile node */
-	/* relation tablespace path, or "" for the cluster default */
-	char	   *tablespace;
-	bool		nsp_alloc;
-	bool		tblsp_alloc;
+	Oid			indtable;		/* if index, OID of its table, else 0 */
+	Oid			toastheap;		/* if toast table, OID of base table, else 0 */
+	char	   *tablespace;		/* tablespace path; "" for cluster default */
+	bool		nsp_alloc;		/* should nspname be freed? */
+	bool		tblsp_alloc;	/* should tablespace be freed? */
 } RelInfo;
 
 typedef struct
@@ -352,7 +353,6 @@ void		disable_old_cluster(void);
 /* dump.c */
 
 void		generate_old_dump(void);
-void		optionally_create_toast_tables(void);
 
 
 /* exec.c */
@@ -367,11 +367,12 @@ bool		pid_lock_file_exists(const char *datadir);
 
 /* file.c */
 
-const char *copyFile(const char *src, const char *dst, bool force);
-const char *linkFile(const char *src, const char *dst);
-const char *rewriteVisibilityMap(const char *fromfile, const char *tofile,
-								 bool force);
-
+void copyFile(const char *src, const char *dst,
+		 const char *schemaName, const char *relName);
+void linkFile(const char *src, const char *dst,
+		 const char *schemaName, const char *relName);
+void rewriteVisibilityMap(const char *fromfile, const char *tofile,
+					 const char *schemaName, const char *relName);
 void		check_hard_link(void);
 FILE	   *fopen_priv(const char *path, const char *mode);
 
@@ -397,7 +398,6 @@ void		get_sock_dir(ClusterInfo *cluster, bool live_check);
 
 /* relfilenode.c */
 
-void		get_pg_database_relfilenode(ClusterInfo *cluster);
 void transfer_all_new_tablespaces(DbInfoArr *old_db_arr,
 				  DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata);
 void transfer_all_new_dbs(DbInfoArr *old_db_arr,
@@ -433,7 +433,6 @@ void		pg_fatal(const char *fmt,...) pg_attribute_printf(1, 2) pg_attribute_noret
 void		end_progress_output(void);
 void		prep_status(const char *fmt,...) pg_attribute_printf(1, 2);
 void		check_ok(void);
-const char *getErrorText(void);
 unsigned int str2uint(const char *str);
 void		pg_putenv(const char *var, const char *val);
 

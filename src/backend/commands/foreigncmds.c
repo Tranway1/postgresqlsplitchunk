@@ -487,7 +487,7 @@ lookup_fdw_handler_func(DefElem *handler)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("function %s must return type %s",
-						NameListToString((List *) handler->arg), "fdw_handler")));
+				   NameListToString((List *) handler->arg), "fdw_handler")));
 
 	return handlerOid;
 }
@@ -1148,10 +1148,6 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	else
 		useId = get_rolespec_oid(stmt->user, false);
 
-	/* Additional check to protect reserved role names */
-	check_rolespec_name(stmt->user,
-						"Cannot specify reserved role as mapping user.");
-
 	/* Check that the server exists. */
 	srv = GetForeignServerByName(stmt->servername, false);
 
@@ -1252,10 +1248,6 @@ AlterUserMapping(AlterUserMappingStmt *stmt)
 	else
 		useId = get_rolespec_oid(stmt->user, false);
 
-	/* Additional check to protect reserved role names */
-	check_rolespec_name(stmt->user,
-						"Cannot alter reserved role mapping user.");
-
 	srv = GetForeignServerByName(stmt->servername, false);
 
 	umId = GetSysCacheOid2(USERMAPPINGUSERSERVER,
@@ -1345,11 +1337,6 @@ RemoveUserMapping(DropUserMappingStmt *stmt)
 	else
 	{
 		useId = get_rolespec_oid(stmt->user, stmt->missing_ok);
-
-		/* Additional check to protect reserved role names */
-		check_rolespec_name(stmt->user,
-							"Cannot remove reserved role mapping user.");
-
 		if (!OidIsValid(useId))
 		{
 			/*

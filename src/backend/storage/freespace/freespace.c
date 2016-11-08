@@ -199,13 +199,13 @@ RecordPageWithFreeSpace(Relation rel, BlockNumber heapBlk, Size spaceAvail)
  */
 void
 UpdateFreeSpaceMap(Relation rel, BlockNumber startBlkNum,
-					BlockNumber endBlkNum, Size freespace)
+				   BlockNumber endBlkNum, Size freespace)
 {
 	int			new_cat = fsm_space_avail_to_cat(freespace);
 	FSMAddress	addr;
 	uint16		slot;
-	BlockNumber	blockNum;
-	BlockNumber	lastBlkOnPage;
+	BlockNumber blockNum;
+	BlockNumber lastBlkOnPage;
 
 	blockNum = startBlkNum;
 
@@ -219,9 +219,9 @@ UpdateFreeSpaceMap(Relation rel, BlockNumber startBlkNum,
 		fsm_update_recursive(rel, addr, new_cat);
 
 		/*
-		 * Get the last block number on this FSM page.  If that's greater
-		 * than or equal to our endBlkNum, we're done.  Otherwise, advance
-		 * to the first block on the next page.
+		 * Get the last block number on this FSM page.  If that's greater than
+		 * or equal to our endBlkNum, we're done.  Otherwise, advance to the
+		 * first block on the next page.
 		 */
 		lastBlkOnPage = fsm_get_lastblckno(rel, addr);
 		if (lastBlkOnPage >= endBlkNum)
@@ -327,8 +327,26 @@ FreeSpaceMapTruncateRel(Relation rel, BlockNumber nblocks)
 		if (!BufferIsValid(buf))
 			return;				/* nothing to do; the FSM was already smaller */
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+		/* NO EREPORT(ERROR) from here till changes are logged */
+		START_CRIT_SECTION();
+
 		fsm_truncate_avail(BufferGetPage(buf), first_removed_slot);
-		MarkBufferDirtyHint(buf, false);
+
+		/*
+		 * Truncation of a relation is WAL-logged at a higher-level, and we
+		 * will be called at WAL replay. But if checksums are enabled, we need
+		 * to still write a WAL record to protect against a torn page, if the
+		 * page is flushed to disk before the truncation WAL record. We cannot
+		 * use MarkBufferDirtyHint here, because that will not dirty the page
+		 * during recovery.
+		 */
+		MarkBufferDirty(buf);
+		if (!InRecovery && RelationNeedsWAL(rel) && XLogHintBitIsNeeded())
+			log_newpage_buffer(buf, false);
+
+		END_CRIT_SECTION();
+
 		UnlockReleaseBuffer(buf);
 
 		new_nfsmblocks = fsm_logical_to_physical(first_removed_address) + 1;
@@ -841,8 +859,8 @@ fsm_get_lastblckno(Relation rel, FSMAddress addr)
 	int			slot;
 
 	/*
-	 * Get the last slot number on the given address and convert that to
-	 * block number
+	 * Get the last slot number on the given address and convert that to block
+	 * number
 	 */
 	slot = SlotsPerFSMPage - 1;
 	return fsm_get_heap_blk(addr, slot);
@@ -862,8 +880,8 @@ fsm_update_recursive(Relation rel, FSMAddress addr, uint8 new_cat)
 		return;
 
 	/*
-	 * Get the parent page and our slot in the parent page, and
-	 * update the information in that.
+	 * Get the parent page and our slot in the parent page, and update the
+	 * information in that.
 	 */
 	parent = fsm_get_parent(addr, &parentslot);
 	fsm_set_and_search(rel, parent, parentslot, new_cat, 0);

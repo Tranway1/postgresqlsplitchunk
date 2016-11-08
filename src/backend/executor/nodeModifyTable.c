@@ -194,10 +194,25 @@ ExecCheckHeapTupleVisible(EState *estate,
 	if (!IsolationUsesXactSnapshot())
 		return;
 
+	/*
+	 * We need buffer pin and lock to call HeapTupleSatisfiesVisibility.
+	 * Caller should be holding pin, but not lock.
+	 */
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	if (!HeapTupleSatisfiesVisibility(tuple, estate->es_snapshot, buffer))
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+	{
+		/*
+		 * We should not raise a serialization failure if the conflict is
+		 * against a tuple inserted by our own transaction, even if it's not
+		 * visible to our snapshot.  (This would happen, for example, if
+		 * conflicting keys are proposed for insertion in a single command.)
+		 */
+		if (!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple->t_data)))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 			 errmsg("could not serialize access due to concurrent update")));
+	}
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 }
 
 /*
@@ -1221,10 +1236,10 @@ ExecOnConflictUpdate(ModifyTableState *mtstate,
 	/*
 	 * Note that it is possible that the target tuple has been modified in
 	 * this session, after the above heap_lock_tuple. We choose to not error
-	 * out in that case, in line with ExecUpdate's treatment of similar
-	 * cases. This can happen if an UPDATE is triggered from within
-	 * ExecQual(), ExecWithCheckOptions() or ExecProject() above, e.g. by
-	 * selecting from a wCTE in the ON CONFLICT's SET.
+	 * out in that case, in line with ExecUpdate's treatment of similar cases.
+	 * This can happen if an UPDATE is triggered from within ExecQual(),
+	 * ExecWithCheckOptions() or ExecProject() above, e.g. by selecting from a
+	 * wCTE in the ON CONFLICT's SET.
 	 */
 
 	/* Execute UPDATE with projection */
@@ -1595,7 +1610,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 
 		/* Initialize the usesFdwDirectModify flag */
 		resultRelInfo->ri_usesFdwDirectModify = bms_is_member(i,
-												node->fdwDirectModifyPlans);
+												 node->fdwDirectModifyPlans);
 
 		/*
 		 * Verify result relation is a valid target for the current operation

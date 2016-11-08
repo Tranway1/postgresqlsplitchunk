@@ -192,9 +192,10 @@ _equalAggref(const Aggref *a, const Aggref *b)
 {
 	COMPARE_SCALAR_FIELD(aggfnoid);
 	COMPARE_SCALAR_FIELD(aggtype);
-	COMPARE_SCALAR_FIELD(aggoutputtype);
 	COMPARE_SCALAR_FIELD(aggcollid);
 	COMPARE_SCALAR_FIELD(inputcollid);
+	/* ignore aggtranstype since it might not be set yet */
+	COMPARE_NODE_FIELD(aggargtypes);
 	COMPARE_NODE_FIELD(aggdirectargs);
 	COMPARE_NODE_FIELD(args);
 	COMPARE_NODE_FIELD(aggorder);
@@ -202,10 +203,9 @@ _equalAggref(const Aggref *a, const Aggref *b)
 	COMPARE_NODE_FIELD(aggfilter);
 	COMPARE_SCALAR_FIELD(aggstar);
 	COMPARE_SCALAR_FIELD(aggvariadic);
-	COMPARE_SCALAR_FIELD(aggcombine);
-	COMPARE_SCALAR_FIELD(aggpartial);
 	COMPARE_SCALAR_FIELD(aggkind);
 	COMPARE_SCALAR_FIELD(agglevelsup);
+	COMPARE_SCALAR_FIELD(aggsplit);
 	COMPARE_LOCATION_FIELD(location);
 
 	return true;
@@ -620,6 +620,17 @@ _equalMinMaxExpr(const MinMaxExpr *a, const MinMaxExpr *b)
 }
 
 static bool
+_equalSQLValueFunction(const SQLValueFunction *a, const SQLValueFunction *b)
+{
+	COMPARE_SCALAR_FIELD(op);
+	COMPARE_SCALAR_FIELD(type);
+	COMPARE_SCALAR_FIELD(typmod);
+	COMPARE_LOCATION_FIELD(location);
+
+	return true;
+}
+
+static bool
 _equalXmlExpr(const XmlExpr *a, const XmlExpr *b)
 {
 	COMPARE_SCALAR_FIELD(op);
@@ -910,6 +921,7 @@ _equalQuery(const Query *a, const Query *b)
 	COMPARE_SCALAR_FIELD(resultRelation);
 	COMPARE_SCALAR_FIELD(hasAggs);
 	COMPARE_SCALAR_FIELD(hasWindowFuncs);
+	COMPARE_SCALAR_FIELD(hasTargetSRFs);
 	COMPARE_SCALAR_FIELD(hasSubLinks);
 	COMPARE_SCALAR_FIELD(hasDistinctOn);
 	COMPARE_SCALAR_FIELD(hasRecursive);
@@ -1454,10 +1466,11 @@ static bool
 _equalAlterEnumStmt(const AlterEnumStmt *a, const AlterEnumStmt *b)
 {
 	COMPARE_NODE_FIELD(typeName);
+	COMPARE_STRING_FIELD(oldVal);
 	COMPARE_STRING_FIELD(newVal);
 	COMPARE_STRING_FIELD(newValNeighbor);
 	COMPARE_SCALAR_FIELD(newValIsAfter);
-	COMPARE_SCALAR_FIELD(skipIfExists);
+	COMPARE_SCALAR_FIELD(skipIfNewValExists);
 
 	return true;
 }
@@ -1892,6 +1905,7 @@ _equalCreateTrigStmt(const CreateTrigStmt *a, const CreateTrigStmt *b)
 	COMPARE_NODE_FIELD(columns);
 	COMPARE_NODE_FIELD(whenClause);
 	COMPARE_SCALAR_FIELD(isconstraint);
+	COMPARE_NODE_FIELD(transitionRels);
 	COMPARE_SCALAR_FIELD(deferrable);
 	COMPARE_SCALAR_FIELD(initdeferred);
 	COMPARE_NODE_FIELD(constrrel);
@@ -2413,6 +2427,7 @@ _equalDefElem(const DefElem *a, const DefElem *b)
 	COMPARE_STRING_FIELD(defname);
 	COMPARE_NODE_FIELD(arg);
 	COMPARE_SCALAR_FIELD(defaction);
+	COMPARE_LOCATION_FIELD(location);
 
 	return true;
 }
@@ -2423,6 +2438,7 @@ _equalLockingClause(const LockingClause *a, const LockingClause *b)
 	COMPARE_NODE_FIELD(lockedRels);
 	COMPARE_SCALAR_FIELD(strength);
 	COMPARE_SCALAR_FIELD(waitPolicy);
+	COMPARE_LOCATION_FIELD(location);
 
 	return true;
 }
@@ -2615,6 +2631,16 @@ _equalRoleSpec(const RoleSpec *a, const RoleSpec *b)
 	COMPARE_SCALAR_FIELD(roletype);
 	COMPARE_STRING_FIELD(rolename);
 	COMPARE_LOCATION_FIELD(location);
+
+	return true;
+}
+
+static bool
+_equalTriggerTransition(const TriggerTransition *a, const TriggerTransition *b)
+{
+	COMPARE_STRING_FIELD(name);
+	COMPARE_SCALAR_FIELD(isNew);
+	COMPARE_SCALAR_FIELD(isTable);
 
 	return true;
 }
@@ -2841,6 +2867,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_MinMaxExpr:
 			retval = _equalMinMaxExpr(a, b);
+			break;
+		case T_SQLValueFunction:
+			retval = _equalSQLValueFunction(a, b);
 			break;
 		case T_XmlExpr:
 			retval = _equalXmlExpr(a, b);
@@ -3368,6 +3397,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_RoleSpec:
 			retval = _equalRoleSpec(a, b);
+			break;
+		case T_TriggerTransition:
+			retval = _equalTriggerTransition(a, b);
 			break;
 
 		default:

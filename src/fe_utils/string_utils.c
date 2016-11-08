@@ -143,8 +143,8 @@ fmtId(const char *rawid)
  *
  * Like fmtId, use the result before calling again.
  *
- * Since we call fmtId and it also uses getThreadLocalPQExpBuffer() we cannot
- * use it until we're finished with calling fmtId().
+ * Since we call fmtId and it also uses getLocalPQExpBuffer() we cannot
+ * use that buffer until we're finished with calling fmtId().
  */
 const char *
 fmtQualifiedId(int remoteVersion, const char *schema, const char *id)
@@ -165,6 +165,44 @@ fmtQualifiedId(int remoteVersion, const char *schema, const char *id)
 	destroyPQExpBuffer(lcl_pqexp);
 
 	return id_return->data;
+}
+
+
+/*
+ * Format a Postgres version number (in the PG_VERSION_NUM integer format
+ * returned by PQserverVersion()) as a string.  This exists mainly to
+ * encapsulate knowledge about two-part vs. three-part version numbers.
+ *
+ * For re-entrancy, caller must supply the buffer the string is put in.
+ * Recommended size of the buffer is 32 bytes.
+ *
+ * Returns address of 'buf', as a notational convenience.
+ */
+char *
+formatPGVersionNumber(int version_number, bool include_minor,
+					  char *buf, size_t buflen)
+{
+	if (version_number >= 100000)
+	{
+		/* New two-part style */
+		if (include_minor)
+			snprintf(buf, buflen, "%d.%d", version_number / 10000,
+					 version_number % 10000);
+		else
+			snprintf(buf, buflen, "%d", version_number / 10000);
+	}
+	else
+	{
+		/* Old three-part style */
+		if (include_minor)
+			snprintf(buf, buflen, "%d.%d.%d", version_number / 10000,
+					 (version_number / 100) % 100,
+					 version_number % 100);
+		else
+			snprintf(buf, buflen, "%d.%d", version_number / 10000,
+					 (version_number / 100) % 100);
+	}
+	return buf;
 }
 
 
@@ -379,6 +417,223 @@ appendByteaLiteral(PQExpBuffer buf, const unsigned char *str, size_t length,
 
 
 /*
+ * Append the given string to the shell command being built in the buffer,
+ * with shell-style quoting as needed to create exactly one argument.
+ *
+ * Forbid LF or CR characters, which have scant practical use beyond designing
+ * security breaches.  The Windows command shell is unusable as a conduit for
+ * arguments containing LF or CR characters.  A future major release should
+ * reject those characters in CREATE ROLE and CREATE DATABASE, because use
+ * there eventually leads to errors here.
+ */
+void
+appendShellString(PQExpBuffer buf, const char *str)
+{
+#ifdef WIN32
+	int			backslash_run_length = 0;
+#endif
+	const char *p;
+
+	/*
+	 * Don't bother with adding quotes if the string is nonempty and clearly
+	 * contains only safe characters.
+	 */
+	if (*str != '\0' &&
+		strspn(str, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./:") == strlen(str))
+	{
+		appendPQExpBufferStr(buf, str);
+		return;
+	}
+
+#ifndef WIN32
+	appendPQExpBufferChar(buf, '\'');
+	for (p = str; *p; p++)
+	{
+		if (*p == '\n' || *p == '\r')
+		{
+			fprintf(stderr,
+					_("shell command argument contains a newline or carriage return: \"%s\"\n"),
+					str);
+			exit(EXIT_FAILURE);
+		}
+
+		if (*p == '\'')
+			appendPQExpBufferStr(buf, "'\"'\"'");
+		else
+			appendPQExpBufferChar(buf, *p);
+	}
+	appendPQExpBufferChar(buf, '\'');
+#else							/* WIN32 */
+
+	/*
+	 * A Windows system() argument experiences two layers of interpretation.
+	 * First, cmd.exe interprets the string.  Its behavior is undocumented,
+	 * but a caret escapes any byte except LF or CR that would otherwise have
+	 * special meaning.  Handling of a caret before LF or CR differs between
+	 * "cmd.exe /c" and other modes, and it is unusable here.
+	 *
+	 * Second, the new process parses its command line to construct argv (see
+	 * https://msdn.microsoft.com/en-us/library/17w5ykft.aspx).  This treats
+	 * backslash-double quote sequences specially.
+	 */
+	appendPQExpBufferStr(buf, "^\"");
+	for (p = str; *p; p++)
+	{
+		if (*p == '\n' || *p == '\r')
+		{
+			fprintf(stderr,
+					_("shell command argument contains a newline or carriage return: \"%s\"\n"),
+					str);
+			exit(EXIT_FAILURE);
+		}
+
+		/* Change N backslashes before a double quote to 2N+1 backslashes. */
+		if (*p == '"')
+		{
+			while (backslash_run_length)
+			{
+				appendPQExpBufferStr(buf, "^\\");
+				backslash_run_length--;
+			}
+			appendPQExpBufferStr(buf, "^\\");
+		}
+		else if (*p == '\\')
+			backslash_run_length++;
+		else
+			backslash_run_length = 0;
+
+		/*
+		 * Decline to caret-escape the most mundane characters, to ease
+		 * debugging and lest we approach the command length limit.
+		 */
+		if (!((*p >= 'a' && *p <= 'z') ||
+			  (*p >= 'A' && *p <= 'Z') ||
+			  (*p >= '0' && *p <= '9')))
+			appendPQExpBufferChar(buf, '^');
+		appendPQExpBufferChar(buf, *p);
+	}
+
+	/*
+	 * Change N backslashes at end of argument to 2N backslashes, because they
+	 * precede the double quote that terminates the argument.
+	 */
+	while (backslash_run_length)
+	{
+		appendPQExpBufferStr(buf, "^\\");
+		backslash_run_length--;
+	}
+	appendPQExpBufferStr(buf, "^\"");
+#endif   /* WIN32 */
+}
+
+
+/*
+ * Append the given string to the buffer, with suitable quoting for passing
+ * the string as a value, in a keyword/pair value in a libpq connection
+ * string
+ */
+void
+appendConnStrVal(PQExpBuffer buf, const char *str)
+{
+	const char *s;
+	bool		needquotes;
+
+	/*
+	 * If the string is one or more plain ASCII characters, no need to quote
+	 * it. This is quite conservative, but better safe than sorry.
+	 */
+	needquotes = true;
+	for (s = str; *s; s++)
+	{
+		if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+			  (*s >= '0' && *s <= '9') || *s == '_' || *s == '.'))
+		{
+			needquotes = true;
+			break;
+		}
+		needquotes = false;
+	}
+
+	if (needquotes)
+	{
+		appendPQExpBufferChar(buf, '\'');
+		while (*str)
+		{
+			/* ' and \ must be escaped by to \' and \\ */
+			if (*str == '\'' || *str == '\\')
+				appendPQExpBufferChar(buf, '\\');
+
+			appendPQExpBufferChar(buf, *str);
+			str++;
+		}
+		appendPQExpBufferChar(buf, '\'');
+	}
+	else
+		appendPQExpBufferStr(buf, str);
+}
+
+
+/*
+ * Append a psql meta-command that connects to the given database with the
+ * then-current connection's user, host and port.
+ */
+void
+appendPsqlMetaConnect(PQExpBuffer buf, const char *dbname)
+{
+	const char *s;
+	bool		complex;
+
+	/*
+	 * If the name is plain ASCII characters, emit a trivial "\connect "foo"".
+	 * For other names, even many not technically requiring it, skip to the
+	 * general case.  No database has a zero-length name.
+	 */
+	complex = false;
+	for (s = dbname; *s; s++)
+	{
+		if (*s == '\n' || *s == '\r')
+		{
+			fprintf(stderr,
+					_("database name contains a newline or carriage return: \"%s\"\n"),
+					dbname);
+			exit(EXIT_FAILURE);
+		}
+
+		if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+			  (*s >= '0' && *s <= '9') || *s == '_' || *s == '.'))
+		{
+			complex = true;
+		}
+	}
+
+	appendPQExpBufferStr(buf, "\\connect ");
+	if (complex)
+	{
+		PQExpBufferData connstr;
+
+		initPQExpBuffer(&connstr);
+		appendPQExpBuffer(&connstr, "dbname=");
+		appendConnStrVal(&connstr, dbname);
+
+		appendPQExpBuffer(buf, "-reuse-previous=on ");
+
+		/*
+		 * As long as the name does not contain a newline, SQL identifier
+		 * quoting satisfies the psql meta-command parser.  Prefer not to
+		 * involve psql-interpreted single quotes, which behaved differently
+		 * before PostgreSQL 9.2.
+		 */
+		appendPQExpBufferStr(buf, fmtId(connstr.data));
+
+		termPQExpBuffer(&connstr);
+	}
+	else
+		appendPQExpBufferStr(buf, fmtId(dbname));
+	appendPQExpBufferChar(buf, '\n');
+}
+
+
+/*
  * Deconstruct the text representation of a 1-dimensional Postgres array
  * into individual items.
  *
@@ -457,6 +712,78 @@ parsePGArray(const char *atext, char ***itemarray, int *nitems)
 	if (atext[1] != '\0')
 		return false;			/* bogus syntax (embedded '}') */
 	*nitems = curitem;
+	return true;
+}
+
+
+/*
+ * Format a reloptions array and append it to the given buffer.
+ *
+ * "prefix" is prepended to the option names; typically it's "" or "toast.".
+ *
+ * Returns false if the reloptions array could not be parsed (in which case
+ * nothing will have been appended to the buffer), or true on success.
+ *
+ * Note: this logic should generally match the backend's flatten_reloptions()
+ * (in adt/ruleutils.c).
+ */
+bool
+appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
+					  const char *prefix, int encoding, bool std_strings)
+{
+	char	  **options;
+	int			noptions;
+	int			i;
+
+	if (!parsePGArray(reloptions, &options, &noptions))
+	{
+		if (options)
+			free(options);
+		return false;
+	}
+
+	for (i = 0; i < noptions; i++)
+	{
+		char	   *option = options[i];
+		char	   *name;
+		char	   *separator;
+		char	   *value;
+
+		/*
+		 * Each array element should have the form name=value.  If the "=" is
+		 * missing for some reason, treat it like an empty value.
+		 */
+		name = option;
+		separator = strchr(option, '=');
+		if (separator)
+		{
+			*separator = '\0';
+			value = separator + 1;
+		}
+		else
+			value = "";
+
+		if (i > 0)
+			appendPQExpBufferStr(buffer, ", ");
+		appendPQExpBuffer(buffer, "%s%s=", prefix, fmtId(name));
+
+		/*
+		 * In general we need to quote the value; but to avoid unnecessary
+		 * clutter, do not quote if it is an identifier that would not need
+		 * quoting.  (We could also allow numbers, but that is a bit trickier
+		 * than it looks --- for example, are leading zeroes significant?  We
+		 * don't want to assume very much here about what custom reloptions
+		 * might mean.)
+		 */
+		if (strcmp(fmtId(value), value) == 0)
+			appendPQExpBufferStr(buffer, value);
+		else
+			appendStringLiteral(buffer, value, encoding, std_strings);
+	}
+
+	if (options)
+		free(options);
+
 	return true;
 }
 

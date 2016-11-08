@@ -183,6 +183,12 @@ typedef struct CopyStateData {
 	/* field raw data pointers found by COPY FROM */
 
 	int max_fields;
+
+	/* Adam: raw fields is a pointer to the buffer of char pointers.
+	 *
+	 * The raw fields points to the fields in the attribute buffer
+	 * (attribute_buf).
+	 */
 	char **raw_fields;
 
 	/*
@@ -284,14 +290,14 @@ if (1) \
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 /* non-export function prototypes */
-static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
-		const char *queryString, const Oid queryRelId, List *attnamelist,
-		List *options);
+static CopyState BeginCopy(ParseState *pstate, bool is_from, Relation rel, Node *raw_query,
+		  const Oid queryRelId, List *attnamelist,
+		  List *options);
 static void EndCopy(CopyState cstate);
 static void ClosePipeToProgram(CopyState cstate);
-static CopyState BeginCopyTo(Relation rel, Node *query, const char *queryString,
-		const Oid queryRelId, const char *filename, bool is_program,
-		List *attnamelist, List *options);
+static CopyState BeginCopyTo(ParseState *pstate, Relation rel, Node *query,
+			const Oid queryRelId, const char *filename, bool is_program,
+			List *attnamelist, List *options);
 static void EndCopyTo(CopyState cstate);
 static uint64 DoCopyTo(CopyState cstate);
 static uint64 CopyTo(CopyState cstate);
@@ -302,6 +308,7 @@ static void CopyFromInsertBatch(CopyState cstate, EState *estate,
 		CommandId mycid, int hi_options, ResultRelInfo *resultRelInfo,
 		TupleTableSlot *myslot, BulkInsertState bistate, int nBufferedTuples,
 		HeapTuple *bufferedTuples, int firstBufferedLineNo);
+/* Adam: it only identifies the line boundaries. */
 static bool CopyReadLine(CopyState cstate);
 static bool CopyReadLineText(CopyState cstate);
 static int CopyReadAttributesText(CopyState cstate);
@@ -348,21 +355,14 @@ static void SendCopyBegin(CopyState cstate) {
 			pq_sendint(&buf, format, 2); /* per-column formats */
 		pq_endmessage(&buf);
 		cstate->copy_dest = COPY_NEW_FE;
-	} else if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 2) {
+	}
+	else
+	{
 		/* old way */
 		if (cstate->binary)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("COPY BINARY is not supported to stdout or from stdin")));
 		pq_putemptymessage('H');
-		/* grottiness needed for old COPY OUT protocol */
-		pq_startcopyout();
-		cstate->copy_dest = COPY_OLD_FE;
-	} else {
-		/* very old way */
-		if (cstate->binary)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("COPY BINARY is not supported to stdout or from stdin")));
-		pq_putemptymessage('B');
 		/* grottiness needed for old COPY OUT protocol */
 		pq_startcopyout();
 		cstate->copy_dest = COPY_OLD_FE;
@@ -385,21 +385,14 @@ static void ReceiveCopyBegin(CopyState cstate) {
 		pq_endmessage(&buf);
 		cstate->copy_dest = COPY_NEW_FE;
 		cstate->fe_msgbuf = makeStringInfo();
-	} else if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 2) {
+	}
+	else
+	{
 		/* old way */
 		if (cstate->binary)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("COPY BINARY is not supported to stdout or from stdin")));
 		pq_putemptymessage('G');
-		/* any error in old protocol will make us lose sync */
-		pq_startmsgread();
-		cstate->copy_dest = COPY_OLD_FE;
-	} else {
-		/* very old way */
-		if (cstate->binary)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("COPY BINARY is not supported to stdout or from stdin")));
-		pq_putemptymessage('D');
 		/* any error in old protocol will make us lose sync */
 		pq_startmsgread();
 		cstate->copy_dest = COPY_OLD_FE;
@@ -712,14 +705,16 @@ static bool CopyLoadRawBuf(CopyState cstate) {
  * Do not allow the copy if user doesn't have proper permission to access
  * the table or the specifically requested columns.
  */
-Oid DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed) {
-	CopyState cstate;
-	bool is_from = stmt->is_from;
-	bool pipe = (stmt->filename == NULL);
-	Relation rel;
-	Oid relid;
-	Node *query = NULL;
-	List *range_table = NIL;
+Oid
+DoCopy(ParseState *pstate, const CopyStmt *stmt, uint64 *processed)
+{
+	CopyState	cstate;
+	bool		is_from = stmt->is_from;
+	bool		pipe = (stmt->filename == NULL);
+	Relation	rel;
+	Oid			relid;
+	Node	   *query = NULL;
+	List	   *range_table = NIL;
 
 	/* Disallow COPY to/from file or program except to superusers. */
 	if (!pipe && !superuser()) {
@@ -783,29 +778,70 @@ Oid DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed) {
 		 */
 		if (check_enable_rls(rte->relid, InvalidOid, false) == RLS_ENABLED) {
 			SelectStmt *select;
-			ColumnRef *cr;
-			ResTarget *target;
-			RangeVar *from;
+			ColumnRef  *cr;
+			ResTarget  *target;
+			RangeVar   *from;
+			List	   *targetList = NIL;
 
 			if (is_from)
 				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("COPY FROM not supported with row-level security"), errhint("Use INSERT statements instead.")));
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				   errmsg("COPY FROM not supported with row-level security"),
+						 errhint("Use INSERT statements instead.")));
 
-			/* Build target list */
-			cr = makeNode(ColumnRef);
-
+			/*
+			 * Build target list
+			 *
+			 * If no columns are specified in the attribute list of the COPY
+			 * command, then the target list is 'all' columns. Therefore, '*'
+			 * should be used as the target list for the resulting SELECT
+			 * statement.
+			 *
+			 * In the case that columns are specified in the attribute list,
+			 * create a ColumnRef and ResTarget for each column and add them to
+			 * the target list for the resulting SELECT statement.
+			 */
 			if (!stmt->attlist)
+			{
+				cr = makeNode(ColumnRef);
 				cr->fields = list_make1(makeNode(A_Star));
+				cr->location = -1;
+
+				target = makeNode(ResTarget);
+				target->name = NULL;
+				target->indirection = NIL;
+				target->val = (Node *) cr;
+				target->location = -1;
+
+				targetList = list_make1(target);
+			}
 			else
-				cr->fields = stmt->attlist;
+			{
+				ListCell   *lc;
 
-			cr->location = 1;
+				foreach(lc, stmt->attlist)
+				{
+					/*
+					 * Build the ColumnRef for each column.  The ColumnRef
+					 * 'fields' property is a String 'Value' node (see
+					 * nodes/value.h) that corresponds to the column name
+					 * respectively.
+					 */
+					cr = makeNode(ColumnRef);
+					cr->fields = list_make1(lfirst(lc));
+					cr->location = -1;
 
-			target = makeNode(ResTarget);
-			target->name = NULL;
-			target->indirection = NIL;
-			target->val = (Node *) cr;
-			target->location = 1;
+					/* Build the ResTarget and add the ColumnRef to it. */
+					target = makeNode(ResTarget);
+					target->name = NULL;
+					target->indirection = NIL;
+					target->val = (Node *) cr;
+					target->location = -1;
+
+					/* Add each column to the SELECT statement's target list */
+					targetList = lappend(targetList, target);
+				}
+			}
 
 			/*
 			 * Build RangeVar for from clause, fully qualified based on the
@@ -816,7 +852,7 @@ Oid DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed) {
 
 			/* Build query */
 			select = makeNode(SelectStmt);
-			select->targetList = list_make1(target);
+			select->targetList = targetList;
 			select->fromClause = list_make1(from);
 
 			query = (Node *) select;
@@ -846,15 +882,18 @@ Oid DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed) {
 			PreventCommandIfReadOnly("COPY FROM");
 		PreventCommandIfParallelMode("COPY FROM");
 
-		cstate = BeginCopyFrom(rel, stmt->filename, stmt->is_program,
-				stmt->attlist, stmt->options);
+		cstate = BeginCopyFrom(pstate, rel, stmt->filename, stmt->is_program,
+							   stmt->attlist, stmt->options);
 		cstate->range_table = range_table;
 		*processed = CopyFrom(cstate); /* copy from file to database */
 		EndCopyFrom(cstate);
-	} else {
-		cstate = BeginCopyTo(rel, query, queryString, relid, stmt->filename,
-				stmt->is_program, stmt->attlist, stmt->options);
-		*processed = DoCopyTo(cstate); /* copy from database to file */
+	}
+	else
+	{
+		cstate = BeginCopyTo(pstate, rel, query, relid,
+							 stmt->filename, stmt->is_program,
+							 stmt->attlist, stmt->options);
+		*processed = DoCopyTo(cstate);	/* copy from database to file */
 		EndCopyTo(cstate);
 	}
 
@@ -886,9 +925,14 @@ Oid DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed) {
  * QUOTE actually exist, has to be applied later.  This just checks for
  * self-consistency of the options list.
  */
-void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
-	bool format_specified = false;
-	ListCell *option;
+void
+ProcessCopyOptions(ParseState *pstate,
+				   CopyState cstate,
+				   bool is_from,
+				   List *options)
+{
+	bool		format_specified = false;
+	ListCell   *option;
 
 	/* Support external use for option sanity checking */
 	if (cstate == NULL)
@@ -914,7 +958,9 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 
 			if (format_specified)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			format_specified = true;
 			if (strcmp(fmt, "text") == 0)
 				/* default format */;
@@ -924,63 +970,95 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 				cstate->binary = true;
 			else
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("COPY format \"%s\" not recognized", fmt)));
-		} else if (strcmp(defel->defname, "oids") == 0) {
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("COPY format \"%s\" not recognized", fmt),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "oids") == 0)
+		{
 			if (cstate->oids)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->oids = defGetBoolean(defel);
 		} else if (strcmp(defel->defname, "freeze") == 0) {
 			if (cstate->freeze)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->freeze = defGetBoolean(defel);
 		} else if (strcmp(defel->defname, "delimiter") == 0) {
 			if (cstate->delim)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->delim = defGetString(defel);
 		} else if (strcmp(defel->defname, "null") == 0) {
 			if (cstate->null_print)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->null_print = defGetString(defel);
 		} else if (strcmp(defel->defname, "header") == 0) {
 			if (cstate->header_line)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->header_line = defGetBoolean(defel);
 		} else if (strcmp(defel->defname, "quote") == 0) {
 			if (cstate->quote)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->quote = defGetString(defel);
 		} else if (strcmp(defel->defname, "escape") == 0) {
 			if (cstate->escape)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->escape = defGetString(defel);
 		} else if (strcmp(defel->defname, "force_quote") == 0) {
 			if (cstate->force_quote || cstate->force_quote_all)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			if (defel->arg && IsA(defel->arg, A_Star))
 				cstate->force_quote_all = true;
 			else if (defel->arg && IsA(defel->arg, List))
 				cstate->force_quote = (List *) defel->arg;
 			else
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be a list of column names", defel->defname)));
-		} else if (strcmp(defel->defname, "force_not_null") == 0) {
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a list of column names",
+								defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "force_not_null") == 0)
+		{
 			if (cstate->force_notnull)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			if (defel->arg && IsA(defel->arg, List))
 				cstate->force_notnull = (List *) defel->arg;
 			else
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be a list of column names", defel->defname)));
-		} else if (strcmp(defel->defname, "force_null") == 0) {
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a list of column names",
+								defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "force_null") == 0)
+		{
 			if (cstate->force_null)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
@@ -988,8 +1066,13 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 				cstate->force_null = (List *) defel->arg;
 			else
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be a list of column names", defel->defname)));
-		} else if (strcmp(defel->defname, "convert_selectively") == 0) {
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a list of column names",
+								defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "convert_selectively") == 0)
+		{
 			/*
 			 * Undocumented, not-accessible-from-SQL option: convert only the
 			 * named columns to binary form, storing the rest as NULLs. It's
@@ -997,21 +1080,32 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 			 */
 			if (cstate->convert_selectively)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->convert_selectively = true;
 			if (defel->arg == NULL || IsA(defel->arg, List))
 				cstate->convert_select = (List *) defel->arg;
 			else
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be a list of column names", defel->defname)));
-		} else if (strcmp(defel->defname, "encoding") == 0) {
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a list of column names",
+								defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "encoding") == 0) {
 			if (cstate->file_encoding >= 0)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			cstate->file_encoding = pg_char_to_encoding(defGetString(defel));
 			if (cstate->file_encoding < 0)
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be a valid encoding name", defel->defname)));
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a valid encoding name",
+								defel->defname),
+						 parser_errposition(pstate, defel->location)));
 		} else if (strcmp(defel->defname, "split") == 0) {
 			if (cstate->split != -1)
 				ereport(ERROR,
@@ -1045,7 +1139,10 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("argument to option \"%s\" must be (greater or equal to 1 or equal -1 for row by row processing)", defel->defname)));
 		} else
 			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR), errmsg("option \"%s\" not recognized", defel->defname)));
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("option \"%s\" not recognized",
+							defel->defname),
+					 parser_errposition(pstate, defel->location)));
 	}
 
 	/*
@@ -1189,12 +1286,18 @@ void ProcessCopyOptions(CopyState cstate, bool is_from, List *options) {
  * If in the text format, delimit columns with delimiter <delim> and print
  * NULL values as <null_print>.
  */
-static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
-		const char *queryString, const Oid queryRelId, List *attnamelist,
-		List *options) {
-	CopyState cstate;
-	TupleDesc tupDesc;
-	int num_phys_attrs;
+static CopyState
+BeginCopy(ParseState *pstate,
+		  bool is_from,
+		  Relation rel,
+		  Node *raw_query,
+		  const Oid queryRelId,
+		  List *attnamelist,
+		  List *options)
+{
+	CopyState	cstate;
+	TupleDesc	tupDesc;
+	int			num_phys_attrs;
 	MemoryContext oldcontext;
 
 	/* Allocate workspace and zero all fields */
@@ -1212,7 +1315,7 @@ static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
 	oldcontext = MemoryContextSwitchTo(cstate->copycontext);
 
 	/* Extract options from the statement node tree */
-	ProcessCopyOptions(cstate, is_from, options);
+	ProcessCopyOptions(pstate, cstate, is_from, options);
 
 	/* Process the source/target relation or query */
 	if (rel) {
@@ -1251,18 +1354,20 @@ static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
 		 * DECLARE CURSOR and PREPARE.)  XXX FIXME someday.
 		 */
 		rewritten = pg_analyze_and_rewrite((Node *) copyObject(raw_query),
-				queryString, NULL, 0);
+										   pstate->p_sourcetext, NULL, 0);
 
 		/* check that we got back something we can work with */
 		if (rewritten == NIL) {
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("DO INSTEAD NOTHING rules are not supported for COPY")));
-		} else if (list_length(rewritten) > 1) {
-			ListCell *lc;
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("DO INSTEAD NOTHING rules are not supported for COPY")));
+		}
+		else if (list_length(rewritten) > 1)
+		{
+			ListCell   *lc;
 
 			/* examine queries to determine which error message to issue */
-			foreach(lc, rewritten)
-			{
+			foreach(lc, rewritten) {
 				Query *q = (Query *) lfirst(lc);
 
 				if (q->querySource == QSRC_QUAL_INSTEAD_RULE)
@@ -1270,7 +1375,9 @@ static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("conditional DO INSTEAD rules are not supported for COPY")));
 				if (q->querySource == QSRC_NON_INSTEAD_RULE)
 					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("DO ALSO rules are not supported for the COPY")));
+
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("DO ALSO rules are not supported for the COPY")));
 			}
 
 			ereport(ERROR,
@@ -1298,7 +1405,8 @@ static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
 							|| query->commandType == CMD_DELETE);
 
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("COPY query must have a RETURNING clause")));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("COPY query must have a RETURNING clause")));
 		}
 
 		/* plan the query */
@@ -1339,9 +1447,10 @@ static CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
 		((DR_copy *) dest)->cstate = cstate;
 
 		/* Create a QueryDesc requesting no output */
-		cstate->queryDesc = CreateQueryDesc(plan, queryString,
-				GetActiveSnapshot(),
-				InvalidSnapshot, dest, NULL, 0);
+		cstate->queryDesc = CreateQueryDesc(plan, pstate->p_sourcetext,
+											GetActiveSnapshot(),
+											InvalidSnapshot,
+											dest, NULL, 0);
 
 		/*
 		 * Call ExecutorStart to prepare the plan for execution.
@@ -1500,11 +1609,18 @@ static void EndCopy(CopyState cstate) {
 /*
  * Setup CopyState to read tuples from a table or a query for COPY TO.
  */
-static CopyState BeginCopyTo(Relation rel, Node *query, const char *queryString,
-		const Oid queryRelId, const char *filename, bool is_program,
-		List *attnamelist, List *options) {
-	CopyState cstate;
-	bool pipe = (filename == NULL);
+static CopyState
+BeginCopyTo(ParseState *pstate,
+			Relation rel,
+			Node *query,
+			const Oid queryRelId,
+			const char *filename,
+			bool is_program,
+			List *attnamelist,
+			List *options)
+{
+	CopyState	cstate;
+	bool		pipe = (filename == NULL);
 	MemoryContext oldcontext;
 
 	if (rel != NULL && rel->rd_rel->relkind != RELKIND_RELATION) {
@@ -1525,8 +1641,8 @@ static CopyState BeginCopyTo(Relation rel, Node *query, const char *queryString,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("cannot copy from non-table relation \"%s\"", RelationGetRelationName(rel))));
 	}
 
-	cstate = BeginCopy(false, rel, query, queryString, queryRelId, attnamelist,
-			options);
+	cstate = BeginCopy(pstate, false, rel, query, queryRelId, attnamelist,
+					   options);
 	oldcontext = MemoryContextSwitchTo(cstate->copycontext);
 
 	if (pipe) {
@@ -1558,8 +1674,18 @@ static CopyState BeginCopyTo(Relation rel, Node *query, const char *queryString,
 			cstate->copy_file = AllocateFile(cstate->filename, PG_BINARY_W);
 			umask(oumask);
 			if (cstate->copy_file == NULL)
+			{
+				/* copy errno because ereport subfunctions might change it */
+				int			save_errno = errno;
+
 				ereport(ERROR,
-						(errcode_for_file_access(), errmsg("could not open file \"%s\" for writing: %m", cstate->filename)));
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\" for writing: %m",
+								cstate->filename),
+						 (save_errno == ENOENT || save_errno == EACCES) ?
+						 errhint("COPY TO instructs the PostgreSQL server process to write a file. "
+								 "You may want a client-side facility such as psql's \\copy.") : 0));
+			}
 
 			if (fstat(fileno(cstate->copy_file), &st))
 				ereport(ERROR,
@@ -2432,11 +2558,17 @@ static void CopyFromInsertBatch(CopyState cstate, EState *estate,
  *
  * Returns a CopyState, to be passed to NextCopyFrom and related functions.
  */
-CopyState BeginCopyFrom(Relation rel, const char *filename, bool is_program,
-		List *attnamelist, List *options) {
-	CopyState cstate;
-	bool pipe = (filename == NULL);
-	TupleDesc tupDesc;
+CopyState
+BeginCopyFrom(ParseState *pstate,
+			  Relation rel,
+			  const char *filename,
+			  bool is_program,
+			  List *attnamelist,
+			  List *options)
+{
+	CopyState	cstate;
+	bool		pipe = (filename == NULL);
+	TupleDesc	tupDesc;
 	Form_pg_attribute *attr;
 	AttrNumber num_phys_attrs, num_defaults;
 	FmgrInfo *in_functions;
@@ -2448,7 +2580,7 @@ CopyState BeginCopyFrom(Relation rel, const char *filename, bool is_program,
 	MemoryContext oldcontext;
 	bool volatile_defexprs;
 
-	cstate = BeginCopy(true, rel, NULL, NULL, InvalidOid, attnamelist, options);
+	cstate = BeginCopy(pstate, true, rel, NULL, InvalidOid, attnamelist, options);
 	oldcontext = MemoryContextSwitchTo(cstate->copycontext);
 
 	/* Initialize state variables */
@@ -2561,8 +2693,18 @@ CopyState BeginCopyFrom(Relation rel, const char *filename, bool is_program,
 
 			cstate->copy_file = AllocateFile(cstate->filename, PG_BINARY_R);
 			if (cstate->copy_file == NULL)
+			{
+				/* copy errno because ereport subfunctions might change it */
+				int			save_errno = errno;
+
 				ereport(ERROR,
-						(errcode_for_file_access(), errmsg("could not open file \"%s\" for reading: %m", cstate->filename)));
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\" for reading: %m",
+								cstate->filename),
+						 (save_errno == ENOENT || save_errno == EACCES) ?
+						 errhint("COPY FROM instructs the PostgreSQL server process to read a file. "
+								 "You may want a client-side facility such as psql's \\copy.") : 0));
+			}
 
 			if (fstat(fileno(cstate->copy_file), &st))
 				ereport(ERROR,
@@ -2619,6 +2761,9 @@ CopyState BeginCopyFrom(Relation rel, const char *filename, bool is_program,
 		int nfields = cstate->file_has_oids ? (attr_count + 1) : attr_count;
 
 		cstate->max_fields = nfields;
+		/* Adam: raw fields is a pointer to the buffer of char pointers
+		 * The raw fields points to the fields in the attribute buffer.
+		 */
 		cstate->raw_fields = (char **) palloc(nfields * sizeof(char *));
 	}
 
@@ -2639,13 +2784,17 @@ CopyState BeginCopyFrom(Relation rel, const char *filename, bool is_program,
  * NOTE: force_not_null option are not applied to the returned fields.
  */
 bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
-	int fldct;
+	int fldct; /* Adam: proabably, field counter */
 	bool done;
 
 	/* only available for text or csv input */
 	Assert(!cstate->binary);
 
-	/* on input just throw the header line away */
+	/* on input just throw the header line away
+	 *
+	 * Adam: the cur_lineno is initialized to zero but for end users we have
+	 * to specify the cur_lineno as 1...N.
+	 * */
 	if (cstate->cur_lineno == 0 && cstate->header_line) {
 		cstate->cur_lineno++;
 		if (CopyReadLine(cstate))
@@ -2902,10 +3051,13 @@ void EndCopyFrom(CopyState cstate) {
  * Result is true if read was terminated by EOF, false if terminated
  * by newline.  The terminating newline or EOF marker is not included
  * in the final value of line_buf.
+ *
+ * Adam: it only identifies the line boundaries.
  */
 static bool CopyReadLine(CopyState cstate) {
 	bool result;
 
+	/* Adam: initial size of line_buf is 1024 bytes. */
 	resetStringInfo(&cstate->line_buf);
 	cstate->line_buf_valid = true;
 
@@ -2920,6 +3072,12 @@ static bool CopyReadLine(CopyState cstate) {
 		 * Reached EOF.  In protocol version 3, we should ignore anything
 		 * after \. up to the protocol end of copy data.  (XXX maybe better
 		 * not to treat \. as special?)
+		 *
+		 * In the pure text format (not csv format), the end of data can be represented by
+		 * a single line containing just backslash-period (\.).
+		 *
+		 * For csv format:  \., the end-of-data marker, could also appear
+		 * as a data value.
 		 */
 		if (cstate->copy_dest == COPY_NEW_FE) {
 			do {
@@ -2930,6 +3088,9 @@ static bool CopyReadLine(CopyState cstate) {
 		/*
 		 * If we didn't hit EOF, then we must have transferred the EOL marker
 		 * to line_buf along with the data.  Get rid of it.
+		 *
+		 * Adam: just change the last new line character(s) "\n" or "\r\n"
+		 * or "\r" to the null byte \0.
 		 */
 		switch (cstate->eol_type) {
 		case EOL_NL:
@@ -2979,7 +3140,10 @@ static bool CopyReadLine(CopyState cstate) {
 }
 
 /*
- * CopyReadLineText - inner loop of CopyReadLine for text mode
+ * CopyReadLineText - inner loop of CopyReadLine for text mode or csv mode.
+ *
+ * This function only finds lines and does not process the lines
+ * (specifically, it does not fine the fields).
  */
 static bool CopyReadLineText(CopyState cstate) {
 	char *copy_raw_buf;
@@ -3069,9 +3233,10 @@ static bool CopyReadLineText(CopyState cstate) {
 		}
 
 		/* OK to fetch a character */
-		prev_raw_ptr = raw_buf_ptr;
-		c = copy_raw_buf[raw_buf_ptr++];
+		prev_raw_ptr = raw_buf_ptr; /* Adam: store the pointer to the current position in the raw buffer. */
+		c = copy_raw_buf[raw_buf_ptr++]; /* just fetch next character from the raw buffer and move the pointer to the raw buffer one character ahead */
 
+		/* Adam: the copy command can operate only in the text, csv or binary mode in the original version of the copy command. */
 		if (cstate->csv_mode) {
 			/*
 			 * If character is '\\' or '\r', we may need to look ahead below.
@@ -3521,21 +3686,44 @@ static int CopyReadAttributesText(CopyState cstate) {
 }
 
 /*
+ * Adam: This is where a lot of processing happens. We have to parse the whole line
+ * and find the field delimiters in the line (the line was extracted from the
+ * input raw file by the CopyReadLineText method.
+ *
  * Parse the current line into separate attributes (fields),
  * performing de-escaping as needed.  This has exactly the same API as
  * CopyReadAttributesText, except we parse the fields according to
  * "standard" (i.e. common) CSV usage.
+ *
+ * @return - number of fields in the line
  */
 static int CopyReadAttributesCSV(CopyState cstate) {
+	/* Adam: column delimiter (must be 1 byte) */
 	char delimc = cstate->delim[0];
+	/* Adam: CSV quote char (must be 1 byte) */
 	char quotec = cstate->quote[0];
+	/* Adam: CSV escape char (must be 1 byte); e.g. escape the quote
+	 * character in the quoted value: "adam\"s" */
 	char escapec = cstate->escape[0];
+	/* Adam: The number of the fields, the enumeration starts from 0, later on:
+	 * fieldno = 0;
+	 * */
 	int fieldno;
+	/* Adam: output_ptr: It points to: the beginning of the attribute buffer,
+	 * then the beginning of every new field and finally to the end of the
+	 * attribute_buf.data (at the end of the whole line processing). */
 	char *output_ptr;
+	/* Adam: current pointer to the line_buf - the buffer that keeps the whole
+	 * line.
+	 */
 	char *cur_ptr;
+	/* Adam: The pointer to the end of the line buffer. */
 	char *line_end_ptr;
 
 	/*
+	 * Adam: this is a very very precise processing - a table can have zero
+	 * columns :)
+	 *
 	 * We need a special case for zero-column tables: check that the input
 	 * line is empty, and return.
 	 */
@@ -3546,6 +3734,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		return 0;
 	}
 
+	/* Adam: just prepare the buffer for the attributes. */
 	resetStringInfo(&cstate->attribute_buf);
 
 	/*
@@ -3557,10 +3746,15 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 	 */
 	if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
 		enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
+	/* Adam: We add the characters to the output buffer (attribute_buf.data
+	 * using the output_ptr!
+	 */
 	output_ptr = cstate->attribute_buf.data;
 
 	/* set pointer variables for loop */
+	/* Adam: the current pointer is the the beginning of the line buffer at the start. */
 	cur_ptr = cstate->line_buf.data;
+	/* Adam: line_end_ptr - is to the end of the line buffer. */
 	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
 
 	/* Outer loop iterates over fields */
@@ -3568,8 +3762,11 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 	for (;;) {
 		bool found_delim = false;
 		bool saw_quote = false;
+		/* Adam: start pointer of the field in the attribute buffer. */
 		char *start_ptr;
+		/* Adam: The end pointer of the field in the attribute buffer. */
 		char *end_ptr;
+		/* Adam: The length of the current field. */
 		int input_len;
 
 		/* Make sure there is enough space for the next value */
@@ -3579,12 +3776,17 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 					cstate->max_fields * sizeof(char *));
 		}
 
-		/* Remember start of field on both input and output sides */
+
+		/* start_ptr point to the beginning of the line buffer
+		 * (cstate->line_buf.data) at the start of processing of the line. */
 		start_ptr = cur_ptr;
+		/* Remember start of field on both input and output sides,
+		 * the output_ptr points to the beginning of the attribute data buffer
+		 * at the start and later on to the beginning of each field. */
 		cstate->raw_fields[fieldno] = output_ptr;
 
 		/*
-		 * Scan data for field,
+		 * Scan data for fields.
 		 *
 		 * The loop starts in "not quote" mode and then toggles between that
 		 * and "in quote" mode. The loop exits normally if it is in "not
@@ -3596,18 +3798,29 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 			/* Not in quote */
 			for (;;) {
 				end_ptr = cur_ptr;
+				/* Adam: this is more like the end of the processing of this
+				 * line from cstate->line_buf.data, but at the same time if the
+				 * line finished then you also finished processing of this very
+				 * field. */
 				if (cur_ptr >= line_end_ptr)
+					/* Adam: indeed, we do not set found_delim = true; which means
+					 * that we did not found the field delimiter so had to finish
+					 * processing when the line end was encountered, so finish
+					 * this metod for line processing to find fields.
+					 */
 					goto endfield;
-				c = *cur_ptr++;
+				/* Adam: get a/(the next) character from the line buffer */
+				c = *cur_ptr++; /* this is also where we iterate through the characters in the input line from the cstate->line_buf.data buffer */
 				/* unquoted field delimiter */
-				if (c == delimc) {
+				if (c == delimc) { /* Adam: check if the current character is the field delimiter */
 					found_delim = true;
 					goto endfield;
 				}
-				/* start of quoted field (or part of field) */
+				/* start of quoted field (or part of a field) */
 				if (c == quotec) {
+					/* can the quoted field show up in the middle of a field? */
 					saw_quote = true;
-					break;
+					break; /* this break moves you to the "In quote" loop */
 				}
 				/* Add c to output string */
 				*output_ptr++ = c;
@@ -3651,17 +3864,25 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				*output_ptr++ = c;
 			}
 		}
+		/* Adam: this is a label for the go to processing - once you are done
+		 * with processing of the current field. */
 		endfield:
 
 		/* Terminate attribute value in output area */
 		*output_ptr++ = '\0';
 
-		/* Check whether raw input matched null marker */
-		input_len = end_ptr - start_ptr;
+		/* Check whether raw input matched null marker.
+		 *
+		 * Adam: cstate->null_print is the NULL marker string (server encoding!)
+		 *
+		 *
+		 * */
+		input_len = end_ptr - start_ptr; /* the length of the field */
 		if (!saw_quote && input_len == cstate->null_print_len
 				&& strncmp(start_ptr, cstate->null_print, input_len) == 0)
 			cstate->raw_fields[fieldno] = NULL;
 
+		/* Adam: increment the number of fields that you found. */
 		fieldno++;
 		/* Done if we hit EOL instead of a delim */
 		if (!found_delim)
@@ -4010,9 +4231,11 @@ static void copy_dest_startup(DestReceiver *self, int operation,
 /*
  * copy_dest_receive --- receive one tuple
  */
-static void copy_dest_receive(TupleTableSlot *slot, DestReceiver *self) {
-	DR_copy *myState = (DR_copy *) self;
-	CopyState cstate = myState->cstate;
+static bool
+copy_dest_receive(TupleTableSlot *slot, DestReceiver *self)
+{
+	DR_copy    *myState = (DR_copy *) self;
+	CopyState	cstate = myState->cstate;
 
 	/* Make sure the tuple is fully deconstructed */
 	slot_getallattrs(slot);
@@ -4020,6 +4243,8 @@ static void copy_dest_receive(TupleTableSlot *slot, DestReceiver *self) {
 	/* And send the data */
 	CopyOneRowTo(cstate, InvalidOid, slot->tts_values, slot->tts_isnull);
 	myState->processed++;
+
+	return true;
 }
 
 /*

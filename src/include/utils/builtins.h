@@ -108,6 +108,11 @@ extern Datum pg_has_role_id_id(PG_FUNCTION_ARGS);
 extern Datum pg_has_role_name(PG_FUNCTION_ARGS);
 extern Datum pg_has_role_id(PG_FUNCTION_ARGS);
 
+/* amutils.c */
+extern Datum pg_indexam_has_property(PG_FUNCTION_ARGS);
+extern Datum pg_index_has_property(PG_FUNCTION_ARGS);
+extern Datum pg_index_column_has_property(PG_FUNCTION_ARGS);
+
 /* bool.c */
 extern Datum boolin(PG_FUNCTION_ARGS);
 extern Datum boolout(PG_FUNCTION_ARGS);
@@ -187,7 +192,6 @@ extern Datum int2vectorin(PG_FUNCTION_ARGS);
 extern Datum int2vectorout(PG_FUNCTION_ARGS);
 extern Datum int2vectorrecv(PG_FUNCTION_ARGS);
 extern Datum int2vectorsend(PG_FUNCTION_ARGS);
-extern Datum int2vectoreq(PG_FUNCTION_ARGS);
 extern Datum int4in(PG_FUNCTION_ARGS);
 extern Datum int4out(PG_FUNCTION_ARGS);
 extern Datum int4recv(PG_FUNCTION_ARGS);
@@ -346,6 +350,8 @@ extern int	is_infinite(double val);
 extern double float8in_internal(char *num, char **endptr_p,
 				  const char *type_name, const char *orig_string);
 extern char *float8out_internal(double num);
+extern int	float4_cmp_internal(float4 a, float4 b);
+extern int	float8_cmp_internal(float8 a, float8 b);
 
 extern Datum float4in(PG_FUNCTION_ARGS);
 extern Datum float4out(PG_FUNCTION_ARGS);
@@ -621,6 +627,8 @@ extern Datum textregexsubstr(PG_FUNCTION_ARGS);
 extern Datum textregexreplace_noopt(PG_FUNCTION_ARGS);
 extern Datum textregexreplace(PG_FUNCTION_ARGS);
 extern Datum similar_escape(PG_FUNCTION_ARGS);
+extern Datum regexp_match(PG_FUNCTION_ARGS);
+extern Datum regexp_match_no_flags(PG_FUNCTION_ARGS);
 extern Datum regexp_matches(PG_FUNCTION_ARGS);
 extern Datum regexp_matches_no_flags(PG_FUNCTION_ARGS);
 extern Datum regexp_split_to_table(PG_FUNCTION_ARGS);
@@ -1212,6 +1220,7 @@ extern Datum txid_snapshot_out(PG_FUNCTION_ARGS);
 extern Datum txid_snapshot_recv(PG_FUNCTION_ARGS);
 extern Datum txid_snapshot_send(PG_FUNCTION_ARGS);
 extern Datum txid_current(PG_FUNCTION_ARGS);
+extern Datum txid_current_if_assigned(PG_FUNCTION_ARGS);
 extern Datum txid_current_snapshot(PG_FUNCTION_ARGS);
 extern Datum txid_snapshot_xmin(PG_FUNCTION_ARGS);
 extern Datum txid_snapshot_xmax(PG_FUNCTION_ARGS);

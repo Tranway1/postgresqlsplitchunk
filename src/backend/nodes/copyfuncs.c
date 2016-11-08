@@ -27,6 +27,7 @@
 #include "nodes/plannodes.h"
 #include "nodes/relation.h"
 #include "utils/datum.h"
+#include "utils/rel.h"
 
 
 /*
@@ -84,6 +85,8 @@ _copyPlannedStmt(const PlannedStmt *from)
 	COPY_SCALAR_FIELD(hasModifyingCTE);
 	COPY_SCALAR_FIELD(canSetTag);
 	COPY_SCALAR_FIELD(transientPlan);
+	COPY_SCALAR_FIELD(dependsOnRole);
+	COPY_SCALAR_FIELD(parallelModeNeeded);
 	COPY_NODE_FIELD(planTree);
 	COPY_NODE_FIELD(rtable);
 	COPY_NODE_FIELD(resultRelations);
@@ -94,9 +97,6 @@ _copyPlannedStmt(const PlannedStmt *from)
 	COPY_NODE_FIELD(relationOids);
 	COPY_NODE_FIELD(invalItems);
 	COPY_SCALAR_FIELD(nParamExec);
-	COPY_SCALAR_FIELD(hasRowSecurity);
-	COPY_SCALAR_FIELD(parallelModeNeeded);
-	COPY_SCALAR_FIELD(hasForeignJoin);
 
 	return newnode;
 }
@@ -869,9 +869,7 @@ _copyAgg(const Agg *from)
 	CopyPlanFields((const Plan *) from, (Plan *) newnode);
 
 	COPY_SCALAR_FIELD(aggstrategy);
-	COPY_SCALAR_FIELD(combineStates);
-	COPY_SCALAR_FIELD(finalizeAggs);
-	COPY_SCALAR_FIELD(serialStates);
+	COPY_SCALAR_FIELD(aggsplit);
 	COPY_SCALAR_FIELD(numCols);
 	if (from->numCols > 0)
 	{
@@ -879,6 +877,7 @@ _copyAgg(const Agg *from)
 		COPY_POINTER_FIELD(grpOperators, from->numCols * sizeof(Oid));
 	}
 	COPY_SCALAR_FIELD(numGroups);
+	COPY_BITMAPSET_FIELD(aggParams);
 	COPY_NODE_FIELD(groupingSets);
 	COPY_NODE_FIELD(chain);
 
@@ -1234,9 +1233,10 @@ _copyAggref(const Aggref *from)
 
 	COPY_SCALAR_FIELD(aggfnoid);
 	COPY_SCALAR_FIELD(aggtype);
-	COPY_SCALAR_FIELD(aggoutputtype);
 	COPY_SCALAR_FIELD(aggcollid);
 	COPY_SCALAR_FIELD(inputcollid);
+	COPY_SCALAR_FIELD(aggtranstype);
+	COPY_NODE_FIELD(aggargtypes);
 	COPY_NODE_FIELD(aggdirectargs);
 	COPY_NODE_FIELD(args);
 	COPY_NODE_FIELD(aggorder);
@@ -1244,10 +1244,9 @@ _copyAggref(const Aggref *from)
 	COPY_NODE_FIELD(aggfilter);
 	COPY_SCALAR_FIELD(aggstar);
 	COPY_SCALAR_FIELD(aggvariadic);
-	COPY_SCALAR_FIELD(aggpartial);
-	COPY_SCALAR_FIELD(aggcombine);
 	COPY_SCALAR_FIELD(aggkind);
 	COPY_SCALAR_FIELD(agglevelsup);
+	COPY_SCALAR_FIELD(aggsplit);
 	COPY_LOCATION_FIELD(location);
 
 	return newnode;
@@ -1749,6 +1748,22 @@ _copyMinMaxExpr(const MinMaxExpr *from)
 	COPY_SCALAR_FIELD(inputcollid);
 	COPY_SCALAR_FIELD(op);
 	COPY_NODE_FIELD(args);
+	COPY_LOCATION_FIELD(location);
+
+	return newnode;
+}
+
+/*
+ * _copySQLValueFunction
+ */
+static SQLValueFunction *
+_copySQLValueFunction(const SQLValueFunction *from)
+{
+	SQLValueFunction *newnode = makeNode(SQLValueFunction);
+
+	COPY_SCALAR_FIELD(op);
+	COPY_SCALAR_FIELD(type);
+	COPY_SCALAR_FIELD(typmod);
 	COPY_LOCATION_FIELD(location);
 
 	return newnode;
@@ -2661,6 +2676,7 @@ _copyDefElem(const DefElem *from)
 	COPY_STRING_FIELD(defname);
 	COPY_NODE_FIELD(arg);
 	COPY_SCALAR_FIELD(defaction);
+	COPY_LOCATION_FIELD(location);
 
 	return newnode;
 }
@@ -2702,6 +2718,18 @@ _copyRoleSpec(const RoleSpec *from)
 	return newnode;
 }
 
+static TriggerTransition *
+_copyTriggerTransition(const TriggerTransition *from)
+{
+	TriggerTransition *newnode = makeNode(TriggerTransition);
+
+	COPY_STRING_FIELD(name);
+	COPY_SCALAR_FIELD(isNew);
+	COPY_SCALAR_FIELD(isTable);
+
+	return newnode;
+}
+
 static Query *
 _copyQuery(const Query *from)
 {
@@ -2715,6 +2743,7 @@ _copyQuery(const Query *from)
 	COPY_SCALAR_FIELD(resultRelation);
 	COPY_SCALAR_FIELD(hasAggs);
 	COPY_SCALAR_FIELD(hasWindowFuncs);
+	COPY_SCALAR_FIELD(hasTargetSRFs);
 	COPY_SCALAR_FIELD(hasSubLinks);
 	COPY_SCALAR_FIELD(hasDistinctOn);
 	COPY_SCALAR_FIELD(hasRecursive);
@@ -3359,10 +3388,11 @@ _copyAlterEnumStmt(const AlterEnumStmt *from)
 	AlterEnumStmt *newnode = makeNode(AlterEnumStmt);
 
 	COPY_NODE_FIELD(typeName);
+	COPY_STRING_FIELD(oldVal);
 	COPY_STRING_FIELD(newVal);
 	COPY_STRING_FIELD(newValNeighbor);
 	COPY_SCALAR_FIELD(newValIsAfter);
-	COPY_SCALAR_FIELD(skipIfExists);
+	COPY_SCALAR_FIELD(skipIfNewValExists);
 
 	return newnode;
 }
@@ -3875,6 +3905,7 @@ _copyCreateTrigStmt(const CreateTrigStmt *from)
 	COPY_NODE_FIELD(columns);
 	COPY_NODE_FIELD(whenClause);
 	COPY_SCALAR_FIELD(isconstraint);
+	COPY_NODE_FIELD(transitionRels);
 	COPY_SCALAR_FIELD(deferrable);
 	COPY_SCALAR_FIELD(initdeferred);
 	COPY_NODE_FIELD(constrrel);
@@ -4252,6 +4283,24 @@ _copyValue(const Value *from)
 	return newnode;
 }
 
+
+static ForeignKeyCacheInfo *
+_copyForeignKeyCacheInfo(const ForeignKeyCacheInfo *from)
+{
+	ForeignKeyCacheInfo *newnode = makeNode(ForeignKeyCacheInfo);
+
+	COPY_SCALAR_FIELD(conrelid);
+	COPY_SCALAR_FIELD(confrelid);
+	COPY_SCALAR_FIELD(nkeys);
+	/* COPY_SCALAR_FIELD might work for these, but let's not assume that */
+	memcpy(newnode->conkey, from->conkey, sizeof(newnode->conkey));
+	memcpy(newnode->confkey, from->confkey, sizeof(newnode->confkey));
+	memcpy(newnode->conpfeqop, from->conpfeqop, sizeof(newnode->conpfeqop));
+
+	return newnode;
+}
+
+
 /*
  * copyObject
  *
@@ -4508,6 +4557,9 @@ copyObject(const void *from)
 			break;
 		case T_MinMaxExpr:
 			retval = _copyMinMaxExpr(from);
+			break;
+		case T_SQLValueFunction:
+			retval = _copySQLValueFunction(from);
 			break;
 		case T_XmlExpr:
 			retval = _copyXmlExpr(from);
@@ -5048,6 +5100,16 @@ copyObject(const void *from)
 			break;
 		case T_RoleSpec:
 			retval = _copyRoleSpec(from);
+			break;
+		case T_TriggerTransition:
+			retval = _copyTriggerTransition(from);
+			break;
+
+			/*
+			 * MISCELLANEOUS NODES
+			 */
+		case T_ForeignKeyCacheInfo:
+			retval = _copyForeignKeyCacheInfo(from);
 			break;
 
 		default:

@@ -1153,13 +1153,13 @@ SetupLockInTable(LockMethod lockMethodTable, PGPROC *proc,
 		uint32		partition = LockHashPartition(hashcode);
 
 		/*
-		 * It might seem unsafe to access proclock->groupLeader without a lock,
-		 * but it's not really.  Either we are initializing a proclock on our
-		 * own behalf, in which case our group leader isn't changing because
-		 * the group leader for a process can only ever be changed by the
-		 * process itself; or else we are transferring a fast-path lock to the
-		 * main lock table, in which case that process can't change it's lock
-		 * group leader without first releasing all of its locks (and in
+		 * It might seem unsafe to access proclock->groupLeader without a
+		 * lock, but it's not really.  Either we are initializing a proclock
+		 * on our own behalf, in which case our group leader isn't changing
+		 * because the group leader for a process can only ever be changed by
+		 * the process itself; or else we are transferring a fast-path lock to
+		 * the main lock table, in which case that process can't change it's
+		 * lock group leader without first releasing all of its locks (and in
 		 * particular the one we are currently transferring).
 		 */
 		proclock->groupLeader = proc->lockGroupLeader != NULL ?
@@ -1319,10 +1319,9 @@ LockCheckConflicts(LockMethod lockMethodTable,
 	}
 
 	/*
-	 * Rats.  Something conflicts.  But it could still be my own lock, or
-	 * a lock held by another member of my locking group.  First, figure out
-	 * how many conflicts remain after subtracting out any locks I hold
-	 * myself.
+	 * Rats.  Something conflicts.  But it could still be my own lock, or a
+	 * lock held by another member of my locking group.  First, figure out how
+	 * many conflicts remain after subtracting out any locks I hold myself.
 	 */
 	myLocks = proclock->holdMask;
 	for (i = 1; i <= numLockModes; i++)
@@ -1357,9 +1356,10 @@ LockCheckConflicts(LockMethod lockMethodTable,
 	/*
 	 * Locks held in conflicting modes by members of our own lock group are
 	 * not real conflicts; we can subtract those out and see if we still have
-	 * a conflict.  This is O(N) in the number of processes holding or awaiting
-	 * locks on this object.  We could improve that by making the shared memory
-	 * state more complex (and larger) but it doesn't seem worth it.
+	 * a conflict.  This is O(N) in the number of processes holding or
+	 * awaiting locks on this object.  We could improve that by making the
+	 * shared memory state more complex (and larger) but it doesn't seem worth
+	 * it.
 	 */
 	procLocks = &(lock->procLocks);
 	otherproclock = (PROCLOCK *)
@@ -1370,7 +1370,7 @@ LockCheckConflicts(LockMethod lockMethodTable,
 			proclock->groupLeader == otherproclock->groupLeader &&
 			(otherproclock->holdMask & conflictMask) != 0)
 		{
-			int	intersectMask = otherproclock->holdMask & conflictMask;
+			int			intersectMask = otherproclock->holdMask & conflictMask;
 
 			for (i = 1; i <= numLockModes; i++)
 			{
@@ -1676,7 +1676,6 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 		set_ps_display(new_status, false);
 		new_status[len] = '\0'; /* truncate off " waiting" */
 	}
-	pgstat_report_wait_start(WAIT_LOCK, locallock->tag.lock.locktag_type);
 
 	awaitedLock = locallock;
 	awaitedOwner = owner;
@@ -1724,7 +1723,6 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 		/* In this path, awaitedLock remains set until LockErrorCleanup */
 
 		/* Report change to non-waiting status */
-		pgstat_report_wait_end();
 		if (update_process_title)
 		{
 			set_ps_display(new_status, false);
@@ -1739,7 +1737,6 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 	awaitedLock = NULL;
 
 	/* Report change to non-waiting status */
-	pgstat_report_wait_end();
 	if (update_process_title)
 	{
 		set_ps_display(new_status, false);
@@ -2583,8 +2580,8 @@ FastPathTransferRelationLocks(LockMethod lockMethodTable, const LOCKTAG *locktag
 		 *
 		 * proc->databaseId is set at backend startup time and never changes
 		 * thereafter, so it might be safe to perform this test before
-		 * acquiring &proc->backendLock.  In particular, it's certainly safe to
-		 * assume that if the target backend holds any fast-path locks, it
+		 * acquiring &proc->backendLock.  In particular, it's certainly safe
+		 * to assume that if the target backend holds any fast-path locks, it
 		 * must have performed a memory-fencing operation (in particular, an
 		 * LWLock acquisition) since setting proc->databaseId.  However, it's
 		 * less clear that our backend is certain to have performed a memory

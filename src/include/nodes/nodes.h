@@ -166,6 +166,7 @@ typedef enum NodeTag
 	T_RowCompareExpr,
 	T_CoalesceExpr,
 	T_MinMaxExpr,
+	T_SQLValueFunction,
 	T_XmlExpr,
 	T_NullTest,
 	T_BooleanTest,
@@ -452,6 +453,7 @@ typedef enum NodeTag
 	T_OnConflictClause,
 	T_CommonTableExpr,
 	T_RoleSpec,
+	T_TriggerTransition,
 
 	/*
 	 * TAGS FOR REPLICATION GRAMMAR PARSE NODES (replnodes.h)
@@ -479,7 +481,8 @@ typedef enum NodeTag
 	T_InlineCodeBlock,			/* in nodes/parsenodes.h */
 	T_FdwRoutine,				/* in foreign/fdwapi.h */
 	T_IndexAmRoutine,			/* in access/amapi.h */
-	T_TsmRoutine				/* in access/tsmapi.h */
+	T_TsmRoutine,				/* in access/tsmapi.h */
+	T_ForeignKeyCacheInfo		/* in utils/rel.h */
 } NodeTag;
 
 /*
@@ -549,16 +552,17 @@ extern PGDLLIMPORT Node *newNodeMacroHolder;
 /*
  * nodes/{outfuncs.c,print.c}
  */
-extern char *nodeToString(const void *obj);
-
 struct Bitmapset;				/* not to include bitmapset.h here */
 struct StringInfoData;			/* not to include stringinfo.h here */
+
 extern void outNode(struct StringInfoData *str, const void *obj);
 extern void outToken(struct StringInfoData *str, const char *s);
 extern void outBitmapset(struct StringInfoData *str,
 			 const struct Bitmapset *bms);
 extern void outDatum(struct StringInfoData *str, uintptr_t value,
-					 int typlen, bool typbyval);
+		 int typlen, bool typbyval);
+extern char *nodeToString(const void *obj);
+extern char *bmsToString(const struct Bitmapset *bms);
 
 /*
  * nodes/{readfuncs.c,read.c}
@@ -692,6 +696,36 @@ typedef enum AggStrategy
 	AGG_SORTED,					/* grouped agg, input must be sorted */
 	AGG_HASHED					/* grouped agg, use internal hashtable */
 } AggStrategy;
+
+/*
+ * AggSplit -
+ *	  splitting (partial aggregation) modes for Agg plan nodes
+ *
+ * This is needed in both plannodes.h and relation.h, so put it here...
+ */
+
+/* Primitive options supported by nodeAgg.c: */
+#define AGGSPLITOP_COMBINE		0x01	/* substitute combinefn for transfn */
+#define AGGSPLITOP_SKIPFINAL	0x02	/* skip finalfn, return state as-is */
+#define AGGSPLITOP_SERIALIZE	0x04	/* apply serializefn to output */
+#define AGGSPLITOP_DESERIALIZE	0x08	/* apply deserializefn to input */
+
+/* Supported operating modes (i.e., useful combinations of these options): */
+typedef enum AggSplit
+{
+	/* Basic, non-split aggregation: */
+	AGGSPLIT_SIMPLE = 0,
+	/* Initial phase of partial aggregation, with serialization: */
+	AGGSPLIT_INITIAL_SERIAL = AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE,
+	/* Final phase of partial aggregation, with deserialization: */
+	AGGSPLIT_FINAL_DESERIAL = AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE
+} AggSplit;
+
+/* Test whether an AggSplit value selects each primitive option: */
+#define DO_AGGSPLIT_COMBINE(as)		(((as) & AGGSPLITOP_COMBINE) != 0)
+#define DO_AGGSPLIT_SKIPFINAL(as)	(((as) & AGGSPLITOP_SKIPFINAL) != 0)
+#define DO_AGGSPLIT_SERIALIZE(as)	(((as) & AGGSPLITOP_SERIALIZE) != 0)
+#define DO_AGGSPLIT_DESERIALIZE(as) (((as) & AGGSPLITOP_DESERIALIZE) != 0)
 
 /*
  * SetOpCmd and SetOpStrategy -

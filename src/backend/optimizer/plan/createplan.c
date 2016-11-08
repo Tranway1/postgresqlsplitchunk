@@ -314,15 +314,12 @@ create_plan(PlannerInfo *root, Path *best_path)
 
 	/*
 	 * Attach any initPlans created in this query level to the topmost plan
-	 * node.  (The initPlans could actually go in any plan node at or above
-	 * where they're referenced, but there seems no reason to put them any
-	 * lower than the topmost node for the query level.)
+	 * node.  (In principle the initplans could go in any plan node at or
+	 * above where they're referenced, but there seems no reason to put them
+	 * any lower than the topmost node for the query level.  Also, see
+	 * comments for SS_finalize_plan before you try to change this.)
 	 */
 	SS_attach_initplans(root, plan);
-
-	/* Update parallel safety information if needed. */
-	if (!best_path->parallel_safe)
-		root->glob->wholePlanParallelSafe = false;
 
 	/* Check we successfully assigned all NestLoopParams to plan nodes */
 	if (root->curOuterParams != NIL)
@@ -544,8 +541,13 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 		{
 			/* For index-only scan, the preferred tlist is the index's */
 			tlist = copyObject(((IndexPath *) best_path)->indexinfo->indextlist);
-			/* Transfer any sortgroupref data to the replacement tlist */
-			apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
+
+			/*
+			 * Transfer any sortgroupref data to the replacement tlist, unless
+			 * we don't care because the gating Result will handle it.
+			 */
+			if (!gating_clauses)
+				apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
 		}
 		else
 		{
@@ -557,8 +559,9 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 			}
 			else
 			{
-				/* Transfer any sortgroupref data to the replacement tlist */
-				apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
+				/* As above, transfer sortgroupref data to replacement tlist */
+				if (!gating_clauses)
+					apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
 			}
 		}
 	}
@@ -787,10 +790,14 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 	 * to emit any sort/group columns that are not simple Vars.  (If they are
 	 * simple Vars, they should appear in the physical tlist, and
 	 * apply_pathtarget_labeling_to_tlist will take care of getting them
-	 * labeled again.)
+	 * labeled again.)	We also have to check that no two sort/group columns
+	 * are the same Var, else that element of the physical tlist would need
+	 * conflicting ressortgroupref labels.
 	 */
 	if ((flags & CP_LABEL_TLIST) && path->pathtarget->sortgrouprefs)
 	{
+		Bitmapset  *sortgroupatts = NULL;
+
 		i = 0;
 		foreach(lc, path->pathtarget->exprs)
 		{
@@ -799,7 +806,14 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 			if (path->pathtarget->sortgrouprefs[i])
 			{
 				if (expr && IsA(expr, Var))
-					 /* okay */ ;
+				{
+					int			attno = ((Var *) expr)->varattno;
+
+					attno -= FirstLowInvalidHeapAttributeNumber;
+					if (bms_is_member(attno, sortgroupatts))
+						return false;
+					sortgroupatts = bms_add_member(sortgroupatts, attno);
+				}
 				else
 					return false;
 			}
@@ -1293,9 +1307,7 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		plan = (Plan *) make_agg(build_path_tlist(root, &best_path->path),
 								 NIL,
 								 AGG_HASHED,
-								 false,
-								 true,
-								 false,
+								 AGGSPLIT_SIMPLE,
 								 numGroupCols,
 								 groupColIdx,
 								 groupOperators,
@@ -1383,7 +1395,7 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 
 	gather_plan = make_gather(tlist,
 							  NIL,
-							  best_path->path.parallel_degree,
+							  best_path->path.parallel_workers,
 							  best_path->single_copy,
 							  subplan);
 
@@ -1398,8 +1410,9 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 /*
  * create_projection_plan
  *
- *	  Create a Result node to do a projection step and (recursively) plans
- *	  for its subpaths.
+ *	  Create a plan tree to do a projection step and (recursively) plans
+ *	  for its subpaths.  We may need a Result node for the projection,
+ *	  but sometimes we can just let the subplan do the work.
  */
 static Plan *
 create_projection_plan(PlannerInfo *root, ProjectionPath *best_path)
@@ -1414,32 +1427,37 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path)
 	tlist = build_path_tlist(root, &best_path->path);
 
 	/*
-	 * We might not really need a Result node here.  There are several ways
-	 * that this can happen.  For example, MergeAppend doesn't project, so we
-	 * would have thought that we needed a projection to attach resjunk sort
-	 * columns to its output ... but create_merge_append_plan might have
-	 * added those same resjunk sort columns to both MergeAppend and its
-	 * children.  Alternatively, apply_projection_to_path might have created
-	 * a projection path as the subpath of a Gather node even though the
-	 * subpath was projection-capable.  So, if the subpath is capable of
-	 * projection or the desired tlist is the same expression-wise as the
-	 * subplan's, just jam it in there.  We'll have charged for a Result that
-	 * doesn't actually appear in the plan, but that's better than having a
-	 * Result we don't need.
+	 * We might not really need a Result node here, either because the subplan
+	 * can project or because it's returning the right list of expressions
+	 * anyway.  Usually create_projection_path will have detected that and set
+	 * dummypp if we don't need a Result; but its decision can't be final,
+	 * because some createplan.c routines change the tlists of their nodes.
+	 * (An example is that create_merge_append_plan might add resjunk sort
+	 * columns to a MergeAppend.)  So we have to recheck here.  If we do
+	 * arrive at a different answer than create_projection_path did, we'll
+	 * have made slightly wrong cost estimates; but label the plan with the
+	 * cost estimates we actually used, not "corrected" ones.  (XXX this could
+	 * be cleaned up if we moved more of the sortcolumn setup logic into Path
+	 * creation, but that would add expense to creating Paths we might end up
+	 * not using.)
 	 */
 	if (is_projection_capable_path(best_path->subpath) ||
 		tlist_same_exprs(tlist, subplan->targetlist))
 	{
+		/* Don't need a separate Result, just assign tlist to subplan */
 		plan = subplan;
 		plan->targetlist = tlist;
 
-		/* Adjust cost to match what we thought during planning */
+		/* Label plan with the estimated costs we actually used */
 		plan->startup_cost = best_path->path.startup_cost;
 		plan->total_cost = best_path->path.total_cost;
+		plan->plan_rows = best_path->path.rows;
+		plan->plan_width = best_path->path.pathtarget->width;
 		/* ... but be careful not to munge subplan's parallel-aware flag */
 	}
 	else
 	{
+		/* We need a Result node */
 		plan = (Plan *) make_result(tlist, NULL, subplan);
 
 		copy_generic_path_info(plan, (Path *) best_path);
@@ -1593,9 +1611,7 @@ create_agg_plan(PlannerInfo *root, AggPath *best_path)
 
 	plan = make_agg(tlist, quals,
 					best_path->aggstrategy,
-					best_path->combineStates,
-					best_path->finalizeAggs,
-					best_path->serialStates,
+					best_path->aggsplit,
 					list_length(best_path->groupClause),
 					extract_grouping_cols(best_path->groupClause,
 										  subplan->targetlist),
@@ -1748,9 +1764,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 			agg_plan = (Plan *) make_agg(NIL,
 										 NIL,
 										 AGG_SORTED,
-										 false,
-										 true,
-										 false,
+										 AGGSPLIT_SIMPLE,
 									   list_length((List *) linitial(gsets)),
 										 new_grpColIdx,
 										 extract_grouping_ops(groupClause),
@@ -1785,9 +1799,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 		plan = make_agg(build_path_tlist(root, &best_path->path),
 						best_path->qual,
 						(numGroupCols > 0) ? AGG_SORTED : AGG_PLAIN,
-						false,
-						true,
-						false,
+						AGGSPLIT_SIMPLE,
 						numGroupCols,
 						top_grpColIdx,
 						extract_grouping_ops(groupClause),
@@ -3231,23 +3243,29 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	/* Copy foreign server OID; likewise, no need to make FDW do this */
 	scan_plan->fs_server = rel->serverid;
 
-	/* Likewise, copy the relids that are represented by this foreign scan */
-	scan_plan->fs_relids = best_path->path.parent->relids;
+	/*
+	 * Likewise, copy the relids that are represented by this foreign scan. An
+	 * upper rel doesn't have relids set, but it covers all the base relations
+	 * participating in the underlying scan, so use root's all_baserels.
+	 */
+	if (rel->reloptkind == RELOPT_UPPER_REL)
+		scan_plan->fs_relids = root->all_baserels;
+	else
+		scan_plan->fs_relids = best_path->path.parent->relids;
 
 	/*
-	 * If a join between foreign relations was pushed down, remember it. The
-	 * push-down safety of the join depends upon the server and user mapping
-	 * being same. That can change between planning and execution time, in which
-	 * case the plan should be invalidated.
+	 * If this is a foreign join, and to make it valid to push down we had to
+	 * assume that the current user is the same as some user explicitly named
+	 * in the query, mark the finished plan as depending on the current user.
 	 */
-	if (scan_relid == 0)
-		root->glob->hasForeignJoin = true;
+	if (rel->useridiscurrent)
+		root->glob->dependsOnRole = true;
 
 	/*
 	 * Replace any outer-relation variables with nestloop params in the qual,
 	 * fdw_exprs and fdw_recheck_quals expressions.  We do this last so that
-	 * the FDW doesn't have to be involved.  (Note that parts of fdw_exprs
-	 * or fdw_recheck_quals could have come from join clauses, so doing this
+	 * the FDW doesn't have to be involved.  (Note that parts of fdw_exprs or
+	 * fdw_recheck_quals could have come from join clauses, so doing this
 	 * beforehand on the scan_clauses wouldn't work.)  We assume
 	 * fdw_scan_tlist contains no such variables.
 	 */
@@ -3268,8 +3286,8 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	 * 0, but there can be no Var with relid 0 in the rel's targetlist or the
 	 * restriction clauses, so we skip this in that case.  Note that any such
 	 * columns in base relations that were joined are assumed to be contained
-	 * in fdw_scan_tlist.)  This is a bit of a kluge and might go away someday,
-	 * so we intentionally leave it out of the API presented to FDWs.
+	 * in fdw_scan_tlist.)	This is a bit of a kluge and might go away
+	 * someday, so we intentionally leave it out of the API presented to FDWs.
 	 */
 	scan_plan->fsSystemCol = false;
 	if (scan_relid > 0)
@@ -5635,8 +5653,7 @@ materialize_finished_plan(Plan *subplan)
 
 Agg *
 make_agg(List *tlist, List *qual,
-		 AggStrategy aggstrategy,
-		 bool combineStates, bool finalizeAggs, bool serialStates,
+		 AggStrategy aggstrategy, AggSplit aggsplit,
 		 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators,
 		 List *groupingSets, List *chain,
 		 double dNumGroups, Plan *lefttree)
@@ -5649,13 +5666,12 @@ make_agg(List *tlist, List *qual,
 	numGroups = (long) Min(dNumGroups, (double) LONG_MAX);
 
 	node->aggstrategy = aggstrategy;
-	node->combineStates = combineStates;
-	node->finalizeAggs = finalizeAggs;
-	node->serialStates = serialStates;
+	node->aggsplit = aggsplit;
 	node->numCols = numGroupCols;
 	node->grpColIdx = grpColIdx;
 	node->grpOperators = grpOperators;
 	node->numGroups = numGroups;
+	node->aggParams = NULL;		/* SS_finalize_plan() will fill this */
 	node->groupingSets = groupingSets;
 	node->chain = chain;
 
@@ -5888,7 +5904,7 @@ make_gather(List *qptlist,
 	plan->righttree = NULL;
 	node->num_workers = nworkers;
 	node->single_copy = single_copy;
-	node->invisible	= false;
+	node->invisible = false;
 
 	return node;
 }

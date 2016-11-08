@@ -1253,9 +1253,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 		unnamed_stmt_context =
 			AllocSetContextCreate(MessageContext,
 								  "unnamed prepared statement",
-								  ALLOCSET_DEFAULT_MINSIZE,
-								  ALLOCSET_DEFAULT_INITSIZE,
-								  ALLOCSET_DEFAULT_MAXSIZE);
+								  ALLOCSET_DEFAULT_SIZES);
 		oldcontext = MemoryContextSwitchTo(unnamed_stmt_context);
 	}
 
@@ -2909,6 +2907,9 @@ ProcessInterrupts(void)
 
 	if (QueryCancelPending)
 	{
+		bool		lock_timeout_occurred;
+		bool		stmt_timeout_occurred;
+
 		/*
 		 * Don't allow query cancel interrupts while reading input from the
 		 * client, because we might lose sync in the FE/BE protocol.  (Die
@@ -2929,17 +2930,29 @@ ProcessInterrupts(void)
 
 		/*
 		 * If LOCK_TIMEOUT and STATEMENT_TIMEOUT indicators are both set, we
-		 * prefer to report the former; but be sure to clear both.
+		 * need to clear both, so always fetch both.
 		 */
-		if (get_timeout_indicator(LOCK_TIMEOUT, true))
+		lock_timeout_occurred = get_timeout_indicator(LOCK_TIMEOUT, true);
+		stmt_timeout_occurred = get_timeout_indicator(STATEMENT_TIMEOUT, true);
+
+		/*
+		 * If both were set, we want to report whichever timeout completed
+		 * earlier; this ensures consistent behavior if the machine is slow
+		 * enough that the second timeout triggers before we get here.  A tie
+		 * is arbitrarily broken in favor of reporting a lock timeout.
+		 */
+		if (lock_timeout_occurred && stmt_timeout_occurred &&
+			get_timeout_finish_time(STATEMENT_TIMEOUT) < get_timeout_finish_time(LOCK_TIMEOUT))
+			lock_timeout_occurred = false;		/* report stmt timeout */
+
+		if (lock_timeout_occurred)
 		{
-			(void) get_timeout_indicator(STATEMENT_TIMEOUT, true);
 			LockErrorCleanup();
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 					 errmsg("canceling statement due to lock timeout")));
 		}
-		if (get_timeout_indicator(STATEMENT_TIMEOUT, true))
+		if (stmt_timeout_occurred)
 		{
 			LockErrorCleanup();
 			ereport(ERROR,
@@ -3755,8 +3768,7 @@ PostgresMain(int argc, char *argv[],
 	/*
 	 * Send this backend's cancellation info to the frontend.
 	 */
-	if (whereToSendOutput == DestRemote &&
-		PG_PROTOCOL_MAJOR(FrontendProtocol) >= 2)
+	if (whereToSendOutput == DestRemote)
 	{
 		StringInfoData buf;
 
@@ -3779,9 +3791,7 @@ PostgresMain(int argc, char *argv[],
 	 */
 	MessageContext = AllocSetContextCreate(TopMemoryContext,
 										   "MessageContext",
-										   ALLOCSET_DEFAULT_MINSIZE,
-										   ALLOCSET_DEFAULT_INITSIZE,
-										   ALLOCSET_DEFAULT_MAXSIZE);
+										   ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Remember stand-alone backend startup time
@@ -4412,15 +4422,15 @@ ShowUsage(const char *title)
 
 	appendStringInfoString(&str, "! system usage stats:\n");
 	appendStringInfo(&str,
-				"!\t%ld.%06ld elapsed %ld.%06ld user %ld.%06ld system sec\n",
-					 (long) (elapse_t.tv_sec - Save_t.tv_sec),
-					 (long) (elapse_t.tv_usec - Save_t.tv_usec),
+				"!\t%ld.%06ld s user, %ld.%06ld s system, %ld.%06ld s elapsed\n",
 					 (long) (r.ru_utime.tv_sec - Save_r.ru_utime.tv_sec),
 					 (long) (r.ru_utime.tv_usec - Save_r.ru_utime.tv_usec),
 					 (long) (r.ru_stime.tv_sec - Save_r.ru_stime.tv_sec),
-					 (long) (r.ru_stime.tv_usec - Save_r.ru_stime.tv_usec));
+					 (long) (r.ru_stime.tv_usec - Save_r.ru_stime.tv_usec),
+					 (long) (elapse_t.tv_sec - Save_t.tv_sec),
+					 (long) (elapse_t.tv_usec - Save_t.tv_usec));
 	appendStringInfo(&str,
-					 "!\t[%ld.%06ld user %ld.%06ld sys total]\n",
+					 "!\t[%ld.%06ld s user, %ld.%06ld s system total]\n",
 					 (long) user.tv_sec,
 					 (long) user.tv_usec,
 					 (long) sys.tv_sec,

@@ -423,9 +423,6 @@ ExecuteGrantStmt(GrantStmt *stmt)
 				grantee_uid = ACL_ID_PUBLIC;
 				break;
 			default:
-				if (!IsBootstrapProcessingMode())
-					check_rolespec_name((Node *) grantee,
-			"Cannot GRANT or REVOKE privileges to or from a reserved role.");
 				grantee_uid = get_rolespec_oid((Node *) grantee, false);
 				break;
 		}
@@ -852,7 +849,7 @@ getRelationsInNamespace(Oid namespaceId, char relkind)
  * ALTER DEFAULT PRIVILEGES statement
  */
 void
-ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt)
+ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *stmt)
 {
 	GrantStmt  *action = stmt->action;
 	InternalDefaultACL iacls;
@@ -874,7 +871,8 @@ ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt)
 			if (dnspnames)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			dnspnames = defel;
 		}
 		else if (strcmp(defel->defname, "roles") == 0)
@@ -882,7 +880,8 @@ ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt)
 			if (drolespecs)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			drolespecs = defel;
 		}
 		else
@@ -921,8 +920,6 @@ ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt)
 				grantee_uid = ACL_ID_PUBLIC;
 				break;
 			default:
-				check_rolespec_name((Node *) grantee,
-	"Cannot GRANT or REVOKE default privileges to or from a reserved role.");
 				grantee_uid = get_rolespec_oid((Node *) grantee, false);
 				break;
 		}
@@ -1013,8 +1010,6 @@ ExecAlterDefaultPrivilegesStmt(AlterDefaultPrivilegesStmt *stmt)
 		{
 			RoleSpec   *rolespec = lfirst(rolecell);
 
-			check_rolespec_name((Node *) rolespec,
-						"Cannot alter default privileges for reserved role.");
 			iacls.roleid = get_rolespec_oid((Node *) rolespec, false);
 
 			/*
@@ -2599,7 +2594,8 @@ ExecGrant_Language(InternalGrant *istmt)
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("language \"%s\" is not trusted",
 							NameStr(pg_language_tuple->lanname)),
-				   errhint("Only superusers can use untrusted languages.")));
+					 errdetail("GRANT and REVOKE are not allowed on untrusted languages, "
+				   "because only superusers can use untrusted languages.")));
 
 		/*
 		 * Get owner ID and working copy of existing ACL. If there's no ACL,
@@ -4115,7 +4111,8 @@ pg_foreign_data_wrapper_aclmask(Oid fdw_oid, Oid roleid,
 	tuple = SearchSysCache1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdw_oid));
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
-				(errmsg("foreign-data wrapper with OID %u does not exist",
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("foreign-data wrapper with OID %u does not exist",
 						fdw_oid)));
 	fdwForm = (Form_pg_foreign_data_wrapper) GETSTRUCT(tuple);
 
@@ -4176,7 +4173,8 @@ pg_foreign_server_aclmask(Oid srv_oid, Oid roleid,
 	tuple = SearchSysCache1(FOREIGNSERVEROID, ObjectIdGetDatum(srv_oid));
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
-				(errmsg("foreign server with OID %u does not exist",
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("foreign server with OID %u does not exist",
 						srv_oid)));
 	srvForm = (Form_pg_foreign_server) GETSTRUCT(tuple);
 
@@ -4235,27 +4233,30 @@ pg_type_aclmask(Oid type_oid, Oid roleid, AclMode mask, AclMaskHow how)
 	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
-				(errmsg("type with OID %u does not exist",
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("type with OID %u does not exist",
 						type_oid)));
 	typeForm = (Form_pg_type) GETSTRUCT(tuple);
 
-	/* "True" array types don't manage permissions of their own */
-	if (typeForm->typelem != 0 && typeForm->typlen == -1)
+	/*
+	 * "True" array types don't manage permissions of their own; consult the
+	 * element type instead.
+	 */
+	if (OidIsValid(typeForm->typelem) && typeForm->typlen == -1)
 	{
 		Oid			elttype_oid = typeForm->typelem;
 
 		ReleaseSysCache(tuple);
 
 		tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(elttype_oid));
+		/* this case is not a user-facing error, so elog not ereport */
 		if (!HeapTupleIsValid(tuple))
-			ereport(ERROR,
-					(errmsg("type with OID %u does not exist",
-							type_oid)));
+			elog(ERROR, "cache lookup failed for type %u", elttype_oid);
 		typeForm = (Form_pg_type) GETSTRUCT(tuple);
 	}
 
 	/*
-	 * Normal case: get the type's ACL from pg_type
+	 * Now get the type's owner and ACL from the tuple
 	 */
 	ownerId = typeForm->typowner;
 

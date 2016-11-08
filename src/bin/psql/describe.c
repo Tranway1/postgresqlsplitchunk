@@ -129,6 +129,73 @@ describeAggregates(const char *pattern, bool verbose, bool showSystem)
 	return true;
 }
 
+/* \dA
+ * Takes an optional regexp to select particular access methods
+ */
+bool
+describeAccessMethods(const char *pattern, bool verbose)
+{
+	PQExpBufferData buf;
+	PGresult   *res;
+	printQueryOpt myopt = pset.popt;
+	static const bool translate_columns[] = {false, true, false, false};
+
+	if (pset.sversion < 90600)
+	{
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support access methods.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
+		return true;
+	}
+
+	initPQExpBuffer(&buf);
+
+	printfPQExpBuffer(&buf,
+					  "SELECT amname AS \"%s\",\n"
+					  "  CASE amtype"
+					  " WHEN 'i' THEN '%s'"
+					  " END AS \"%s\"",
+					  gettext_noop("Name"),
+					  gettext_noop("Index"),
+					  gettext_noop("Type"));
+
+	if (verbose)
+	{
+		appendPQExpBuffer(&buf,
+						  ",\n  amhandler AS \"%s\",\n"
+					  "  pg_catalog.obj_description(oid, 'pg_am') AS \"%s\"",
+						  gettext_noop("Handler"),
+						  gettext_noop("Description"));
+	}
+
+	appendPQExpBufferStr(&buf,
+						 "\nFROM pg_catalog.pg_am\n");
+
+	processSQLNamePattern(pset.db, &buf, pattern, false, false,
+						  NULL, "amname", NULL,
+						  NULL);
+
+	appendPQExpBufferStr(&buf, "ORDER BY 1;");
+
+	res = PSQLexec(buf.data);
+	termPQExpBuffer(&buf);
+	if (!res)
+		return false;
+
+	myopt.nullPrint = NULL;
+	myopt.title = _("List of access methods");
+	myopt.translate_header = true;
+	myopt.translate_columns = translate_columns;
+	myopt.n_translate_columns = lengthof(translate_columns);
+
+	printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
+
+	PQclear(res);
+	return true;
+}
+
 /* \db
  * Takes an optional regexp to select particular tablespaces
  */
@@ -141,8 +208,11 @@ describeTablespaces(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80000)
 	{
-		psql_error("The server (version %d.%d) does not support tablespaces.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support tablespaces.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -234,7 +304,10 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, false, true, true, true, false, false, false, false};
+	static const bool translate_columns[] = {false, false, false, false, true, true, true, false, true, false, false, false, false};
+
+	/* No "Parallel" column before 9.6 */
+	static const bool translate_columns_pre_96[] = {false, false, false, false, true, true, false, true, false, false, false, false};
 
 	if (strlen(functypes) != strspn(functypes, "antwS+"))
 	{
@@ -244,8 +317,11 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 
 	if (showWindow && pset.sversion < 80400)
 	{
-		psql_error("\\df does not take a \"w\" option with server version %d.%d\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("\\df does not take a \"w\" option with server version %s\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -346,28 +422,45 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 						  gettext_noop("Type"));
 
 	if (verbose)
+	{
 		appendPQExpBuffer(&buf,
-				  ",\n CASE WHEN prosecdef THEN '%s' ELSE '%s' END AS \"%s\""
 						  ",\n CASE\n"
 						  "  WHEN p.provolatile = 'i' THEN '%s'\n"
 						  "  WHEN p.provolatile = 's' THEN '%s'\n"
 						  "  WHEN p.provolatile = 'v' THEN '%s'\n"
-						  " END as \"%s\""
-				   ",\n  pg_catalog.pg_get_userbyid(p.proowner) as \"%s\",\n"
-						  "  l.lanname as \"%s\",\n"
-						  "  p.prosrc as \"%s\",\n"
-				  "  pg_catalog.obj_description(p.oid, 'pg_proc') as \"%s\"",
-						  gettext_noop("definer"),
-						  gettext_noop("invoker"),
-						  gettext_noop("Security"),
+						  " END as \"%s\"",
 						  gettext_noop("immutable"),
 						  gettext_noop("stable"),
 						  gettext_noop("volatile"),
-						  gettext_noop("Volatility"),
+						  gettext_noop("Volatility"));
+		if (pset.sversion >= 90600)
+			appendPQExpBuffer(&buf,
+							  ",\n CASE\n"
+							  "  WHEN p.proparallel = 'r' THEN '%s'\n"
+							  "  WHEN p.proparallel = 's' THEN '%s'\n"
+							  "  WHEN p.proparallel = 'u' THEN '%s'\n"
+							  " END as \"%s\"",
+							  gettext_noop("restricted"),
+							  gettext_noop("safe"),
+							  gettext_noop("unsafe"),
+							  gettext_noop("Parallel"));
+		appendPQExpBuffer(&buf,
+					   ",\n pg_catalog.pg_get_userbyid(p.proowner) as \"%s\""
+				 ",\n CASE WHEN prosecdef THEN '%s' ELSE '%s' END AS \"%s\"",
 						  gettext_noop("Owner"),
+						  gettext_noop("definer"),
+						  gettext_noop("invoker"),
+						  gettext_noop("Security"));
+		appendPQExpBufferStr(&buf, ",\n ");
+		printACLColumn(&buf, "p.proacl");
+		appendPQExpBuffer(&buf,
+						  ",\n l.lanname as \"%s\""
+						  ",\n p.prosrc as \"%s\""
+				",\n pg_catalog.obj_description(p.oid, 'pg_proc') as \"%s\"",
 						  gettext_noop("Language"),
 						  gettext_noop("Source code"),
 						  gettext_noop("Description"));
+	}
 
 	appendPQExpBufferStr(&buf,
 						 "\nFROM pg_catalog.pg_proc p"
@@ -466,8 +559,16 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 	myopt.nullPrint = NULL;
 	myopt.title = _("List of functions");
 	myopt.translate_header = true;
-	myopt.translate_columns = translate_columns;
-	myopt.n_translate_columns = lengthof(translate_columns);
+	if (pset.sversion >= 90600)
+	{
+		myopt.translate_columns = translate_columns;
+		myopt.n_translate_columns = lengthof(translate_columns);
+	}
+	else
+	{
+		myopt.translate_columns = translate_columns_pre_96;
+		myopt.n_translate_columns = lengthof(translate_columns_pre_96);
+	}
 
 	printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
 
@@ -870,8 +971,11 @@ listDefaultACLs(const char *pattern)
 
 	if (pset.sversion < 90000)
 	{
-		psql_error("The server (version %d.%d) does not support altering default privileges.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support altering default privileges.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -1218,9 +1322,8 @@ describeOneTableDetails(const char *schemaname,
 	bool		printTableInitialized = false;
 	int			i;
 	char	   *view_def = NULL;
-	char	   *headers[9];
+	char	   *headers[11];
 	char	  **seq_values = NULL;
-	char	  **modifiers = NULL;
 	char	  **ptr;
 	PQExpBufferData title;
 	PQExpBufferData tmpbuf;
@@ -1242,7 +1345,7 @@ describeOneTableDetails(const char *schemaname,
 		char		relpersistence;
 		char		relreplident;
 	}			tableinfo;
-	bool		show_modifiers = false;
+	bool		show_column_details = false;
 	bool		retval;
 
 	retval = false;
@@ -1545,9 +1648,10 @@ describeOneTableDetails(const char *schemaname,
 		tableinfo.relkind == 'm' ||
 		tableinfo.relkind == 'f' || tableinfo.relkind == 'c')
 	{
-		show_modifiers = true;
-		headers[cols++] = gettext_noop("Modifiers");
-		modifiers = pg_malloc0((numrows + 1) * sizeof(*modifiers));
+		headers[cols++] = gettext_noop("Collation");
+		headers[cols++] = gettext_noop("Nullable");
+		headers[cols++] = gettext_noop("Default");
+		show_column_details = true;
 	}
 
 	if (tableinfo.relkind == 'S')
@@ -1605,39 +1709,15 @@ describeOneTableDetails(const char *schemaname,
 		/* Type */
 		printTableAddCell(&cont, PQgetvalue(res, i, 1), false, false);
 
-		/* Modifiers: collate, not null, default */
-		if (show_modifiers)
+		/* Collation, Nullable, Default */
+		if (show_column_details)
 		{
-			resetPQExpBuffer(&tmpbuf);
+			printTableAddCell(&cont, PQgetvalue(res, i, 5), false, false);
 
-			if (!PQgetisnull(res, i, 5))
-			{
-				if (tmpbuf.len > 0)
-					appendPQExpBufferChar(&tmpbuf, ' ');
-				appendPQExpBuffer(&tmpbuf, _("collate %s"),
-								  PQgetvalue(res, i, 5));
-			}
+			printTableAddCell(&cont, strcmp(PQgetvalue(res, i, 3), "t") == 0 ? "not null" : "", false, false);
 
-			if (strcmp(PQgetvalue(res, i, 3), "t") == 0)
-			{
-				if (tmpbuf.len > 0)
-					appendPQExpBufferChar(&tmpbuf, ' ');
-				appendPQExpBufferStr(&tmpbuf, _("not null"));
-			}
-
-			/* handle "default" here */
 			/* (note: above we cut off the 'default' string at 128) */
-			if (strlen(PQgetvalue(res, i, 2)) != 0)
-			{
-				if (tmpbuf.len > 0)
-					appendPQExpBufferChar(&tmpbuf, ' ');
-				/* translator: default values of column definitions */
-				appendPQExpBuffer(&tmpbuf, _("default %s"),
-								  PQgetvalue(res, i, 2));
-			}
-
-			modifiers[i] = pg_strdup(tmpbuf.data);
-			printTableAddCell(&cont, modifiers[i], false, false);
+			printTableAddCell(&cont, PQgetvalue(res, i, 2), false, false);
 		}
 
 		/* Value: for sequences only */
@@ -2566,13 +2646,6 @@ error_return:
 		free(seq_values);
 	}
 
-	if (modifiers)
-	{
-		for (ptr = modifiers; *ptr; ptr++)
-			free(*ptr);
-		free(modifiers);
-	}
-
 	if (view_def)
 		free(view_def);
 
@@ -3131,24 +3204,24 @@ listDomains(const char *pattern, bool verbose, bool showSystem)
 	printfPQExpBuffer(&buf,
 					  "SELECT n.nspname as \"%s\",\n"
 					  "       t.typname as \"%s\",\n"
-	 "       pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"%s\",\n"
-					  "       TRIM(LEADING\n",
+					  "       pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"%s\",\n",
 					  gettext_noop("Schema"),
 					  gettext_noop("Name"),
 					  gettext_noop("Type"));
 
 	if (pset.sversion >= 90100)
-		appendPQExpBufferStr(&buf,
-							 "            COALESCE((SELECT ' collate ' || c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type bt\n"
-							 "                      WHERE c.oid = t.typcollation AND bt.oid = t.typbasetype AND t.typcollation <> bt.typcollation), '') ||\n");
+		appendPQExpBuffer(&buf,
+						  "       (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type bt\n"
+						  "        WHERE c.oid = t.typcollation AND bt.oid = t.typbasetype AND t.typcollation <> bt.typcollation) as \"%s\",\n",
+						  gettext_noop("Collation"));
 	appendPQExpBuffer(&buf,
-	   "            CASE WHEN t.typnotnull THEN ' not null' ELSE '' END ||\n"
-					  "            CASE WHEN t.typdefault IS NOT NULL THEN ' default ' || t.typdefault ELSE '' END\n"
-					  "       ) as \"%s\",\n"
+					  "       CASE WHEN t.typnotnull THEN 'not null' END as \"%s\",\n"
+					  "       t.typdefault as \"%s\",\n"
 					  "       pg_catalog.array_to_string(ARRAY(\n"
 					  "         SELECT pg_catalog.pg_get_constraintdef(r.oid, true) FROM pg_catalog.pg_constraint r WHERE t.oid = r.contypid\n"
 					  "       ), ' ') as \"%s\"",
-					  gettext_noop("Modifier"),
+					  gettext_noop("Nullable"),
+					  gettext_noop("Default"),
 					  gettext_noop("Check"));
 
 	if (verbose)
@@ -3456,8 +3529,11 @@ listCollations(const char *pattern, bool verbose, bool showSystem)
 
 	if (pset.sversion < 90100)
 	{
-		psql_error("The server (version %d.%d) does not support collations.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support collations.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -3588,8 +3664,11 @@ listTSParsers(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80300)
 	{
-		psql_error("The server (version %d.%d) does not support full text search.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support full text search.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -3823,8 +3902,11 @@ listTSDictionaries(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80300)
 	{
-		psql_error("The server (version %d.%d) does not support full text search.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support full text search.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -3891,8 +3973,11 @@ listTSTemplates(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80300)
 	{
-		psql_error("The server (version %d.%d) does not support full text search.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support full text search.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -3959,8 +4044,11 @@ listTSConfigs(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80300)
 	{
-		psql_error("The server (version %d.%d) does not support full text search.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support full text search.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -4157,8 +4245,11 @@ listForeignDataWrappers(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80400)
 	{
-		psql_error("The server (version %d.%d) does not support foreign-data wrappers.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support foreign-data wrappers.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -4237,8 +4328,11 @@ listForeignServers(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80400)
 	{
-		psql_error("The server (version %d.%d) does not support foreign servers.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support foreign servers.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -4316,8 +4410,11 @@ listUserMappings(const char *pattern, bool verbose)
 
 	if (pset.sversion < 80400)
 	{
-		psql_error("The server (version %d.%d) does not support user mappings.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support user mappings.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -4374,8 +4471,11 @@ listForeignTables(const char *pattern, bool verbose)
 
 	if (pset.sversion < 90100)
 	{
-		psql_error("The server (version %d.%d) does not support foreign tables.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support foreign tables.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -4449,8 +4549,11 @@ listExtensions(const char *pattern)
 
 	if (pset.sversion < 90100)
 	{
-		psql_error("The server (version %d.%d) does not support extensions.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support extensions.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -4503,8 +4606,11 @@ listExtensionContents(const char *pattern)
 
 	if (pset.sversion < 90100)
 	{
-		psql_error("The server (version %d.%d) does not support extensions.\n",
-				   pset.sversion / 10000, (pset.sversion / 100) % 100);
+		char		sverbuf[32];
+
+		psql_error("The server (version %s) does not support extensions.\n",
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 

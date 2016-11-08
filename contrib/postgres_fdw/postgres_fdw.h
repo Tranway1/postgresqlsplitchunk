@@ -78,7 +78,7 @@ typedef struct PgFdwRelationInfo
 	ForeignServer *server;
 	UserMapping *user;			/* only set in use_remote_estimate mode */
 
-	int			fetch_size;      /* fetch size for this remote table */
+	int			fetch_size;		/* fetch size for this remote table */
 
 	/*
 	 * Name of the relation while EXPLAINing ForeignScan. It is used for join
@@ -92,6 +92,9 @@ typedef struct PgFdwRelationInfo
 	RelOptInfo *innerrel;
 	JoinType	jointype;
 	List	   *joinclauses;
+
+	/* Grouping information */
+	List	   *grouped_tlist;
 } PgFdwRelationInfo;
 
 /* in postgres_fdw.c */
@@ -133,29 +136,29 @@ extern void deparseUpdateSql(StringInfo buf, PlannerInfo *root,
 				 List *targetAttrs, List *returningList,
 				 List **retrieved_attrs);
 extern void deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
-								   Index rtindex, Relation rel,
-								   List *targetlist,
-								   List *targetAttrs,
-								   List *remote_conds,
-								   List **params_list,
-								   List *returningList,
-								   List **retrieved_attrs);
+					   Index rtindex, Relation rel,
+					   List *targetlist,
+					   List *targetAttrs,
+					   List *remote_conds,
+					   List **params_list,
+					   List *returningList,
+					   List **retrieved_attrs);
 extern void deparseDeleteSql(StringInfo buf, PlannerInfo *root,
 				 Index rtindex, Relation rel,
 				 List *returningList,
 				 List **retrieved_attrs);
 extern void deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
-								   Index rtindex, Relation rel,
-								   List *remote_conds,
-								   List **params_list,
-								   List *returningList,
-								   List **retrieved_attrs);
+					   Index rtindex, Relation rel,
+					   List *remote_conds,
+					   List **params_list,
+					   List *returningList,
+					   List **retrieved_attrs);
 extern void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeSql(StringInfo buf, Relation rel,
 				  List **retrieved_attrs);
 extern void deparseStringLiteral(StringInfo buf, const char *val);
 extern Expr *find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
-extern List *build_tlist_to_deparse(RelOptInfo *foreign_rel);
+extern List *build_tlist_to_deparse(RelOptInfo *foreignrel);
 extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
 						RelOptInfo *foreignrel, List *tlist,
 						List *remote_conds, List *pathkeys,

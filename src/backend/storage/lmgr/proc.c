@@ -39,6 +39,7 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "replication/slot.h"
 #include "replication/syncrep.h"
@@ -194,14 +195,10 @@ InitProcGlobal(void)
 	 * between groups.
 	 */
 	procs = (PGPROC *) ShmemAlloc(TotalProcs * sizeof(PGPROC));
+	MemSet(procs, 0, TotalProcs * sizeof(PGPROC));
 	ProcGlobal->allProcs = procs;
 	/* XXX allProcCount isn't really all of them; it excludes prepared xacts */
 	ProcGlobal->allProcCount = MaxBackends + NUM_AUXILIARY_PROCS;
-	if (!procs)
-		ereport(FATAL,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of shared memory")));
-	MemSet(procs, 0, TotalProcs * sizeof(PGPROC));
 
 	/*
 	 * Also allocate a separate array of PGXACT structures.  This is separate
@@ -288,7 +285,7 @@ InitProcGlobal(void)
 void
 InitProcess(void)
 {
-	PGPROC * volatile * procgloballist;
+	PGPROC	   *volatile * procgloballist;
 
 	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
@@ -342,8 +339,8 @@ InitProcess(void)
 	MyPgXact = &ProcGlobal->allPgXact[MyProc->pgprocno];
 
 	/*
-	 * Cross-check that the PGPROC is of the type we expect; if this were
-	 * not the case, it would get returned to the wrong list.
+	 * Cross-check that the PGPROC is of the type we expect; if this were not
+	 * the case, it would get returned to the wrong list.
 	 */
 	Assert(MyProc->procgloballist == procgloballist);
 
@@ -781,7 +778,7 @@ static void
 ProcKill(int code, Datum arg)
 {
 	PGPROC	   *proc;
-	PGPROC * volatile * procgloballist;
+	PGPROC	   *volatile * procgloballist;
 
 	Assert(MyProc != NULL);
 
@@ -1216,7 +1213,8 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 		}
 		else
 		{
-			WaitLatch(MyLatch, WL_LATCH_SET, 0);
+			WaitLatch(MyLatch, WL_LATCH_SET, 0,
+					  PG_WAIT_LOCK | locallock->tag.lock.locktag_type);
 			ResetLatch(MyLatch);
 			/* check for deadlocks first, as that's probably log-worthy */
 			if (got_deadlock_timeout)
@@ -1726,9 +1724,9 @@ CheckDeadLockAlert(void)
  * wait again if not.
  */
 void
-ProcWaitForSignal(void)
+ProcWaitForSignal(uint32 wait_event_info)
 {
-	WaitLatch(MyLatch, WL_LATCH_SET, 0);
+	WaitLatch(MyLatch, WL_LATCH_SET, 0, wait_event_info);
 	ResetLatch(MyLatch);
 	CHECK_FOR_INTERRUPTS();
 }

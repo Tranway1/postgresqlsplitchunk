@@ -265,7 +265,6 @@ UUID_LIBS = @UUID_LIBS@
 UUID_EXTRA_OBJS = @UUID_EXTRA_OBJS@
 LD = @LD@
 with_gnu_ld = @with_gnu_ld@
-ld_R_works = @ld_R_works@
 
 # We want -L for libpgport.a and libpgcommon.a to be first in LDFLAGS.  We
 # also need LDFLAGS to be a "recursively expanded" variable, else adjustments
@@ -332,7 +331,9 @@ endif
 endif
 
 PROVE = @PROVE@
-PG_PROVE_FLAGS = -I $(top_srcdir)/src/test/perl/
+# There are common routines in src/test/perl, and some test suites have
+# extra perl modules in their own directory.
+PG_PROVE_FLAGS = -I $(top_srcdir)/src/test/perl/ -I $(srcdir)
 PROVE_FLAGS = --verbose
 
 # prepend to path if already set, else just set it
@@ -494,6 +495,10 @@ libpq_pgport += $(LDAP_LIBS_FE)
 endif
 
 
+##########################################################################
+#
+# Commonly used submake targets
+
 submake-libpq:
 	$(MAKE) -C $(libpq_builddir) all
 
@@ -506,7 +511,10 @@ submake-libpgfeutils:
 	$(MAKE) -C $(top_builddir)/src/common all
 	$(MAKE) -C $(top_builddir)/src/fe_utils all
 
-.PHONY: submake-libpq submake-libpgport submake-libpgfeutils
+submake-generated-headers:
+	$(MAKE) -C $(top_builddir)/src/backend generated-headers
+
+.PHONY: submake-libpq submake-libpgport submake-libpgfeutils submake-generated-headers
 
 
 ##########################################################################

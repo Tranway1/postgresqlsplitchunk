@@ -400,18 +400,17 @@ ExecRenameStmt(RenameStmt *stmt)
 ObjectAddress
 ExecAlterObjectDependsStmt(AlterObjectDependsStmt *stmt, ObjectAddress *refAddress)
 {
-	ObjectAddress	address;
-	ObjectAddress	refAddr;
-	Relation		rel;
+	ObjectAddress address;
+	ObjectAddress refAddr;
+	Relation	rel;
 
 	address =
 		get_object_address_rv(stmt->objectType, stmt->relation, stmt->objname,
-							  stmt->objargs, &rel, AccessExclusiveLock, false);
+							stmt->objargs, &rel, AccessExclusiveLock, false);
 
 	/*
-	 * If a relation was involved, it would have been opened and locked.
-	 * We don't need the relation here, but we'll retain the lock until
-	 * commit.
+	 * If a relation was involved, it would have been opened and locked. We
+	 * don't need the relation here, but we'll retain the lock until commit.
 	 */
 	if (rel)
 		heap_close(rel, NoLock);
@@ -630,8 +629,8 @@ AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
 	oldNspOid = DatumGetObjectId(namespace);
 
 	/*
-	 * If the object is already in the correct namespace, we don't need
-	 * to do anything except fire the object access hook.
+	 * If the object is already in the correct namespace, we don't need to do
+	 * anything except fire the object access hook.
 	 */
 	if (oldNspOid == nspOid)
 	{
@@ -747,9 +746,6 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 {
 	Oid			newowner = get_rolespec_oid(stmt->newowner, false);
 
-	check_rolespec_name(stmt->newowner,
-						"Cannot make reserved roles owners of objects.");
-
 	switch (stmt->objectType)
 	{
 		case OBJECT_DATABASE:
@@ -761,7 +757,6 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:		/* same as TYPE */
 			return AlterTypeOwner(stmt->object, newowner, stmt->objectType);
-			break;
 
 		case OBJECT_FDW:
 			return AlterForeignDataWrapperOwner(strVal(linitial(stmt->object)),

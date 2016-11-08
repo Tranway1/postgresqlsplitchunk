@@ -23,7 +23,7 @@
 
 /*
  * Generic option types for validation.
- * NB! Thes are treated as flags, so use only powers of two here.
+ * NB! These are treated as flags, so use only powers of two here.
  */
 typedef enum
 {
@@ -72,8 +72,6 @@ typedef struct ForeignTable
 extern ForeignServer *GetForeignServer(Oid serverid);
 extern ForeignServer *GetForeignServerByName(const char *name, bool missing_ok);
 extern UserMapping *GetUserMapping(Oid userid, Oid serverid);
-extern Oid GetUserMappingId(Oid userid, Oid serverid, bool missing_ok);
-extern UserMapping *GetUserMappingById(Oid umid);
 extern ForeignDataWrapper *GetForeignDataWrapper(Oid fdwid);
 extern ForeignDataWrapper *GetForeignDataWrapperByName(const char *name,
 							bool missing_ok);

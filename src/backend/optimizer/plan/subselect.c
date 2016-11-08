@@ -82,6 +82,7 @@ static Bitmapset *finalize_plan(PlannerInfo *root,
 			  Bitmapset *valid_params,
 			  Bitmapset *scan_params);
 static bool finalize_primnode(Node *node, finalize_primnode_context *context);
+static bool finalize_agg_primnode(Node *node, finalize_primnode_context *context);
 
 
 /*
@@ -1561,7 +1562,7 @@ simplify_EXISTS_query(PlannerInfo *root, Query *query)
 {
 	/*
 	 * We don't try to simplify at all if the query uses set operations,
-	 * aggregates, grouping sets, modifying CTEs, HAVING, OFFSET, or FOR
+	 * aggregates, grouping sets, SRFs, modifying CTEs, HAVING, OFFSET, or FOR
 	 * UPDATE/SHARE; none of these seem likely in normal usage and their
 	 * possible effects are complex.  (Note: we could ignore an "OFFSET 0"
 	 * clause, but that traditionally is used as an optimization fence, so we
@@ -1572,6 +1573,7 @@ simplify_EXISTS_query(PlannerInfo *root, Query *query)
 		query->hasAggs ||
 		query->groupingSets ||
 		query->hasWindowFuncs ||
+		query->hasTargetSRFs ||
 		query->hasModifyingCTE ||
 		query->havingQual ||
 		query->limitOffset ||
@@ -1611,13 +1613,6 @@ simplify_EXISTS_query(PlannerInfo *root, Query *query)
 		/* Whether or not the targetlist is safe, we can drop the LIMIT. */
 		query->limitCount = NULL;
 	}
-
-	/*
-	 * Mustn't throw away the targetlist if it contains set-returning
-	 * functions; those could affect whether zero rows are returned!
-	 */
-	if (expression_returns_set((Node *) query->targetList))
-		return false;
 
 	/*
 	 * Otherwise, we can throw away the targetlist, as well as any GROUP,
@@ -2187,7 +2182,7 @@ SS_charge_for_initplans(PlannerInfo *root, RelOptInfo *final_rel)
  *
  * Attach any initplans created in the current query level to the specified
  * plan node, which should normally be the topmost node for the query level.
- * (The initPlans could actually go in any node at or above where they're
+ * (In principle the initPlans could go in any node at or above where they're
  * referenced; but there seems no reason to put them any lower than the
  * topmost node, so we don't bother to track exactly where they came from.)
  * We do not touch the plan node's cost; the initplans should have been
@@ -2226,9 +2221,22 @@ SS_finalize_plan(PlannerInfo *root, Plan *plan)
  * recursion.
  *
  * The return value is the computed allParam set for the given Plan node.
- * This is just an internal notational convenience.
+ * This is just an internal notational convenience: we can add a child
+ * plan's allParams to the set of param IDs of interest to this level
+ * in the same statement that recurses to that child.
  *
  * Do not scribble on caller's values of valid_params or scan_params!
+ *
+ * Note: although we attempt to deal with initPlans anywhere in the tree, the
+ * logic is not really right.  The problem is that a plan node might return an
+ * output Param of its initPlan as a targetlist item, in which case it's valid
+ * for the parent plan level to reference that same Param; the parent's usage
+ * will be converted into a Var referencing the child plan node by setrefs.c.
+ * But this function would see the parent's reference as out of scope and
+ * complain about it.  For now, this does not matter because the planner only
+ * attaches initPlans to the topmost plan node in a query level, so the case
+ * doesn't arise.  If we ever merge this processing into setrefs.c, maybe it
+ * can be handled more cleanly.
  */
 static Bitmapset *
 finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
@@ -2507,6 +2515,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
 								  &context);
 				finalize_primnode((Node *) mtplan->onConflictWhere,
 								  &context);
+				/* exclRelTlist contains only Vars, doesn't need examination */
 				foreach(l, mtplan->plans)
 				{
 					context.paramids =
@@ -2638,6 +2647,29 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
 										 locally_added_param);
 			break;
 
+		case T_Agg:
+			{
+				Agg		   *agg = (Agg *) plan;
+
+				/*
+				 * AGG_HASHED plans need to know which Params are referenced
+				 * in aggregate calls.  Do a separate scan to identify them.
+				 */
+				if (agg->aggstrategy == AGG_HASHED)
+				{
+					finalize_primnode_context aggcontext;
+
+					aggcontext.root = root;
+					aggcontext.paramids = NULL;
+					finalize_agg_primnode((Node *) agg->plan.targetlist,
+										  &aggcontext);
+					finalize_agg_primnode((Node *) agg->plan.qual,
+										  &aggcontext);
+					agg->aggParams = aggcontext.paramids;
+				}
+			}
+			break;
+
 		case T_WindowAgg:
 			finalize_primnode(((WindowAgg *) plan)->startOffset,
 							  &context);
@@ -2646,7 +2678,6 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
 			break;
 
 		case T_Hash:
-		case T_Agg:
 		case T_Material:
 		case T_Sort:
 		case T_Unique:
@@ -2794,6 +2825,29 @@ finalize_primnode(Node *node, finalize_primnode_context *context)
 		return false;			/* no more to do here */
 	}
 	return expression_tree_walker(node, finalize_primnode,
+								  (void *) context);
+}
+
+/*
+ * finalize_agg_primnode: find all Aggref nodes in the given expression tree,
+ * and add IDs of all PARAM_EXEC params appearing within their aggregated
+ * arguments to the result set.
+ */
+static bool
+finalize_agg_primnode(Node *node, finalize_primnode_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) node;
+
+		/* we should not consider the direct arguments, if any */
+		finalize_primnode((Node *) agg->args, context);
+		finalize_primnode((Node *) agg->aggfilter, context);
+		return false;			/* there can't be any Aggrefs below here */
+	}
+	return expression_tree_walker(node, finalize_agg_primnode,
 								  (void *) context);
 }
 

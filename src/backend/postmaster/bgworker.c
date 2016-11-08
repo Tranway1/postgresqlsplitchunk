@@ -14,8 +14,9 @@
 
 #include <unistd.h>
 
-#include "miscadmin.h"
 #include "libpq/pqsignal.h"
+#include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/postmaster.h"
 #include "storage/barrier.h"
@@ -601,7 +602,6 @@ StartBackgroundWorker(void)
 	 */
 	if ((worker->bgw_flags & BGWORKER_SHMEM_ACCESS) == 0)
 	{
-		on_exit_reset();
 		dsm_detach_all();
 		PGSharedMemoryDetach();
 	}
@@ -969,7 +969,8 @@ WaitForBackgroundWorkerStartup(BackgroundWorkerHandle *handle, pid_t *pidp)
 			break;
 
 		rc = WaitLatch(MyLatch,
-					   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0);
+					   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0,
+					   WAIT_EVENT_BGWORKER_STARTUP);
 
 		if (rc & WL_POSTMASTER_DEATH)
 		{
@@ -1005,13 +1006,17 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
 
 		status = GetBackgroundWorkerPid(handle, &pid);
 		if (status == BGWH_STOPPED)
-			return status;
+			break;
 
 		rc = WaitLatch(&MyProc->procLatch,
-					   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0);
+					   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0,
+					   WAIT_EVENT_BGWORKER_SHUTDOWN);
 
 		if (rc & WL_POSTMASTER_DEATH)
-			return BGWH_POSTMASTER_DIED;
+		{
+			status = BGWH_POSTMASTER_DIED;
+			break;
+		}
 
 		ResetLatch(&MyProc->procLatch);
 	}

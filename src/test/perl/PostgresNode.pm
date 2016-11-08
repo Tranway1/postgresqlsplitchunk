@@ -103,6 +103,7 @@ our ($test_localhost, $test_pghost, $last_port_assigned, @all_nodes);
 
 INIT
 {
+
 	# PGHOST is set once and for all through a single series of tests when
 	# this module is loaded.
 	$test_localhost = "127.0.0.1";
@@ -242,7 +243,13 @@ sub connstr
 	{
 		return "port=$pgport host=$pghost";
 	}
-	return "port=$pgport host=$pghost dbname=$dbname";
+
+	# Escape properly the database string before using it, only
+	# single quotes and backslashes need to be treated this way.
+	$dbname =~ s#\\#\\\\#g;
+	$dbname =~ s#\'#\\\'#g;
+
+	return "port=$pgport host=$pghost dbname='$dbname'";
 }
 
 =pod
@@ -395,12 +402,14 @@ sub init
 	mkdir $self->backup_dir;
 	mkdir $self->archive_dir;
 
-	TestLib::system_or_bail('initdb', '-D', $pgdata, '-A', 'trust', '-N');
+	TestLib::system_or_bail('initdb', '-D', $pgdata, '-A', 'trust', '-N',
+		@{ $params{extra} });
 	TestLib::system_or_bail($ENV{PG_REGRESS}, '--config-auth', $pgdata);
 
 	open my $conf, ">>$pgdata/postgresql.conf";
 	print $conf "\n# Added by PostgresNode.pm\n";
 	print $conf "fsync = off\n";
+	print $conf "log_line_prefix = '%m [%p] %q%a '\n";
 	print $conf "log_statement = all\n";
 	print $conf "port = $port\n";
 
@@ -474,7 +483,8 @@ sub backup
 	my $name        = $self->name;
 
 	print "# Taking pg_basebackup $backup_name from node \"$name\"\n";
-	TestLib::system_or_bail("pg_basebackup -D $backup_path -p $port -x");
+	TestLib::system_or_bail('pg_basebackup', '-D', $backup_path, '-p', $port,
+		'-x', '--no-sync');
 	print "# Backup finished\n";
 }
 
@@ -540,11 +550,12 @@ sub _backup_fs
 
 	if ($hot)
 	{
+
 		# We ignore pg_stop_backup's return value. We also assume archiving
 		# is enabled; otherwise the caller will have to copy the remaining
 		# segments.
-		my $stdout = $self->safe_psql('postgres',
-			'SELECT * FROM pg_stop_backup();');
+		my $stdout =
+		  $self->safe_psql('postgres', 'SELECT * FROM pg_stop_backup();');
 		print "# pg_stop_backup: $stdout\n";
 	}
 
@@ -712,7 +723,7 @@ sub restart
 
 =item $node->promote()
 
-Wrapper for pg_ctl promote
+Wrapper for pg_ctl promote -w
 
 =cut
 
@@ -724,7 +735,8 @@ sub promote
 	my $logfile = $self->logfile;
 	my $name    = $self->name;
 	print "### Promoting node \"$name\"\n";
-	TestLib::system_log('pg_ctl', '-D', $pgdata, '-l', $logfile, 'promote');
+	TestLib::system_log('pg_ctl', '-D', $pgdata, '-w', '-l', $logfile,
+		'promote');
 }
 
 # Internal routine to enable streaming replication on a standby node.
@@ -761,7 +773,7 @@ sub enable_restoring
 	my $copy_command =
 	  $TestLib::windows_os
 	  ? qq{copy "$path\\\\%f" "%p"}
-	  : qq{cp $path/%f %p};
+	  : qq{cp "$path/%f" "%p"};
 
 	$self->append_conf(
 		'recovery.conf', qq(
@@ -789,7 +801,7 @@ sub enable_archiving
 	my $copy_command =
 	  $TestLib::windows_os
 	  ? qq{copy "%p" "$path\\\\%f"}
-	  : qq{cp %p $path/%f};
+	  : qq{cp "%p" "$path/%f"};
 
 	# Enable archive_mode and archive_command on node
 	$self->append_conf(
@@ -842,6 +854,7 @@ sub get_new_node
 
 	while ($found == 0)
 	{
+
 		# advance $port, wrapping correctly around range end
 		$port = 49152 if ++$port >= 65536;
 		print "# Checking port $port\n";
@@ -896,6 +909,7 @@ sub get_new_node
 # order, later when the File::Temp objects are destroyed.
 END
 {
+
 	# take care not to change the script's exit value
 	my $exit_code = $?;
 
@@ -1078,7 +1092,7 @@ sub psql
 	  IPC::Run::timeout($params{timeout}, exception => $timeout_exception)
 	  if (defined($params{timeout}));
 
-	${$params{timed_out}} = 0 if defined $params{timed_out};
+	${ $params{timed_out} } = 0 if defined $params{timed_out};
 
 	# IPC::Run would otherwise append to existing contents:
 	$$stdout = "" if ref($stdout);
@@ -1107,6 +1121,7 @@ sub psql
 		my $exc_save = $@;
 		if ($exc_save)
 		{
+
 			# IPC::Run::run threw an exception. re-throw unless it's a
 			# timeout, which we'll handle by testing is_expired
 			die $exc_save
@@ -1178,7 +1193,7 @@ sub psql
 =item $node->poll_query_until(dbname, query)
 
 Run a query once a second, until it returns 't' (i.e. SQL boolean true).
-Continues polling if psql returns an error result. Times out after 90 seconds.
+Continues polling if psql returns an error result. Times out after 180 seconds.
 
 =cut
 
@@ -1186,7 +1201,7 @@ sub poll_query_until
 {
 	my ($self, $dbname, $query) = @_;
 
-	my $max_attempts = 90;
+	my $max_attempts = 180;
 	my $attempts     = 0;
 	my ($stdout, $stderr);
 
@@ -1208,7 +1223,7 @@ sub poll_query_until
 		$attempts++;
 	}
 
-	# The query result didn't change in 90 seconds. Give up. Print the stderr
+	# The query result didn't change in 180 seconds. Give up. Print the stderr
 	# from the last attempt, hopefully that's useful for debugging.
 	diag $stderr;
 	return 0;
@@ -1290,6 +1305,24 @@ sub issues_sql_like
 	ok($result, "@$cmd exit code 0");
 	my $log = TestLib::slurp_file($self->logfile);
 	like($log, $expected_sql, "$test_name: SQL found in server log");
+}
+
+=pod
+
+=item $node->run_log(...)
+
+Runs a shell command like TestLib::run_log, but with PGPORT set so
+that the command will default to connecting to this PostgresNode.
+
+=cut
+
+sub run_log
+{
+	my $self = shift;
+
+	local $ENV{PGPORT} = $self->port;
+
+	TestLib::run_log(@_);
 }
 
 =pod

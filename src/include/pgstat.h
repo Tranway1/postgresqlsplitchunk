@@ -219,7 +219,20 @@ typedef struct PgStat_MsgDummy
 
 /* ----------
  * PgStat_MsgInquiry			Sent by a backend to ask the collector
- *								to write the stats file.
+ *								to write the stats file(s).
+ *
+ * Ordinarily, an inquiry message prompts writing of the global stats file,
+ * the stats file for shared catalogs, and the stats file for the specified
+ * database.  If databaseid is InvalidOid, only the first two are written.
+ *
+ * New file(s) will be written only if the existing file has a timestamp
+ * older than the specified cutoff_time; this prevents duplicated effort
+ * when multiple requests arrive at nearly the same time, assuming that
+ * backends send requests with cutoff_times a little bit in the past.
+ *
+ * clock_time should be the requestor's current local time; the collector
+ * uses this to check for the system clock going backward, but it has no
+ * effect unless that occurs.  We assume clock_time >= cutoff_time, though.
  * ----------
  */
 
@@ -228,7 +241,7 @@ typedef struct PgStat_MsgInquiry
 	PgStat_MsgHdr m_hdr;
 	TimestampTz clock_time;		/* observed local clock time */
 	TimestampTz cutoff_time;	/* minimum acceptable file timestamp */
-	Oid			databaseid;		/* requested DB (InvalidOid => all DBs) */
+	Oid			databaseid;		/* requested DB (InvalidOid => shared only) */
 } PgStat_MsgInquiry;
 
 
@@ -370,6 +383,7 @@ typedef struct PgStat_MsgAnalyze
 	Oid			m_databaseid;
 	Oid			m_tableoid;
 	bool		m_autovacuum;
+	bool		m_resetcounter;
 	TimestampTz m_analyzetime;
 	PgStat_Counter m_live_tuples;
 	PgStat_Counter m_dead_tuples;
@@ -701,15 +715,91 @@ typedef enum BackendState
  * Wait Classes
  * ----------
  */
-typedef enum WaitClass
-{
-	WAIT_UNDEFINED,
-	WAIT_LWLOCK_NAMED,
-	WAIT_LWLOCK_TRANCHE,
-	WAIT_LOCK,
-	WAIT_BUFFER_PIN
-}	WaitClass;
+#define PG_WAIT_LWLOCK_NAMED		0x01000000U
+#define PG_WAIT_LWLOCK_TRANCHE		0x02000000U
+#define PG_WAIT_LOCK				0x03000000U
+#define PG_WAIT_BUFFER_PIN			0x04000000U
+#define PG_WAIT_ACTIVITY			0x05000000U
+#define PG_WAIT_CLIENT				0x06000000U
+#define PG_WAIT_EXTENSION			0x07000000U
+#define PG_WAIT_IPC					0x08000000U
+#define PG_WAIT_TIMEOUT				0x09000000U
 
+/* ----------
+ * Wait Events - Activity
+ *
+ * Use this category when a process is waiting because it has no work to do,
+ * unless the "Client" or "Timeout" category describes the situation better.
+ * Typically, this should only be used for background processes.
+ * ----------
+ */
+typedef enum
+{
+	WAIT_EVENT_ARCHIVER_MAIN = PG_WAIT_ACTIVITY,
+	WAIT_EVENT_AUTOVACUUM_MAIN,
+	WAIT_EVENT_BGWRITER_HIBERNATE,
+	WAIT_EVENT_BGWRITER_MAIN,
+	WAIT_EVENT_CHECKPOINTER_MAIN,
+	WAIT_EVENT_PGSTAT_MAIN,
+	WAIT_EVENT_RECOVERY_WAL_ALL,
+	WAIT_EVENT_RECOVERY_WAL_STREAM,
+	WAIT_EVENT_SYSLOGGER_MAIN,
+	WAIT_EVENT_WAL_RECEIVER_MAIN,
+	WAIT_EVENT_WAL_SENDER_MAIN,
+	WAIT_EVENT_WAL_WRITER_MAIN
+} WaitEventActivity;
+
+/* ----------
+ * Wait Events - Client
+ *
+ * Use this category when a process is waiting to send data to or receive data
+ * from the frontend process to which it is connected.  This is never used for
+ * a background process, which has no client connection.
+ * ----------
+ */
+typedef enum
+{
+	WAIT_EVENT_CLIENT_READ = PG_WAIT_CLIENT,
+	WAIT_EVENT_CLIENT_WRITE,
+	WAIT_EVENT_SSL_OPEN_SERVER,
+	WAIT_EVENT_WAL_RECEIVER_WAIT_START,
+	WAIT_EVENT_WAL_SENDER_WAIT_WAL,
+	WAIT_EVENT_WAL_SENDER_WRITE_DATA
+} WaitEventClient;
+
+/* ----------
+ * Wait Events - IPC
+ *
+ * Use this category when a process cannot complete the work it is doing because
+ * it is waiting for a notification from another process.
+ * ----------
+ */
+typedef enum
+{
+	WAIT_EVENT_BGWORKER_SHUTDOWN = PG_WAIT_IPC,
+	WAIT_EVENT_BGWORKER_STARTUP,
+	WAIT_EVENT_EXECUTE_GATHER,
+	WAIT_EVENT_MQ_INTERNAL,
+	WAIT_EVENT_MQ_PUT_MESSAGE,
+	WAIT_EVENT_MQ_RECEIVE,
+	WAIT_EVENT_MQ_SEND,
+	WAIT_EVENT_PARALLEL_FINISH,
+	WAIT_EVENT_SAFE_SNAPSHOT,
+	WAIT_EVENT_SYNC_REP
+} WaitEventIPC;
+
+/* ----------
+ * Wait Events - Timeout
+ *
+ * Use this category when a process is waiting for a timeout to expire.
+ * ----------
+ */
+typedef enum
+{
+	WAIT_EVENT_BASE_BACKUP_THROTTLE = PG_WAIT_TIMEOUT,
+	WAIT_EVENT_PG_SLEEP,
+	WAIT_EVENT_RECOVERY_APPLY_DELAY
+} WaitEventTimeout;
 
 /* ----------
  * Command type for progress reporting purposes
@@ -719,7 +809,7 @@ typedef enum ProgressCommandType
 {
 	PROGRESS_COMMAND_INVALID,
 	PROGRESS_COMMAND_VACUUM
-}	ProgressCommandType;
+} ProgressCommandType;
 
 #define PGSTAT_NUM_PROGRESS_PARAM	10
 
@@ -805,7 +895,7 @@ typedef struct PgBackendStatus
 	/*
 	 * Command progress reporting.  Any command which wishes can advertise
 	 * that it is running by setting st_progress_command,
-	 * st_progress_command_target, and st_progress_command[].
+	 * st_progress_command_target, and st_progress_param[].
 	 * st_progress_command_target should be the OID of the relation which the
 	 * command targets (we assume there's just one, as this is meant for
 	 * utility commands), but the meaning of each element in the
@@ -957,7 +1047,8 @@ extern void pgstat_report_autovac(Oid dboid);
 extern void pgstat_report_vacuum(Oid tableoid, bool shared,
 					 PgStat_Counter livetuples, PgStat_Counter deadtuples);
 extern void pgstat_report_analyze(Relation rel,
-					  PgStat_Counter livetuples, PgStat_Counter deadtuples);
+					  PgStat_Counter livetuples, PgStat_Counter deadtuples,
+					  bool resetcounter);
 
 extern void pgstat_report_recovery_conflict(int reason);
 extern void pgstat_report_deadlock(void);
@@ -992,9 +1083,9 @@ extern void pgstat_initstats(Relation rel);
  *
  *	Called from places where server process needs to wait.  This is called
  *	to report wait event information.  The wait information is stored
- *	as 4-bytes where first byte repersents the wait event class (type of
+ *	as 4-bytes where first byte represents the wait event class (type of
  *	wait, for different types of wait, refer WaitClass) and the next
- *	3-bytes repersent the actual wait event.  Currently 2-bytes are used
+ *	3-bytes represent the actual wait event.  Currently 2-bytes are used
  *	for wait event which is sufficient for current usage, 1-byte is
  *	reserved for future usage.
  *
@@ -1003,23 +1094,18 @@ extern void pgstat_initstats(Relation rel);
  * ----------
  */
 static inline void
-pgstat_report_wait_start(uint8 classId, uint16 eventId)
+pgstat_report_wait_start(uint32 wait_event_info)
 {
 	volatile PGPROC *proc = MyProc;
-	uint32		wait_event_val;
 
 	if (!pgstat_track_activities || !proc)
 		return;
-
-	wait_event_val = classId;
-	wait_event_val <<= 24;
-	wait_event_val |= eventId;
 
 	/*
 	 * Since this is a four-byte field which is always read and written as
 	 * four-bytes, updates are atomic.
 	 */
-	proc->wait_event_info = wait_event_val;
+	proc->wait_event_info = wait_event_info;
 }
 
 /* ----------

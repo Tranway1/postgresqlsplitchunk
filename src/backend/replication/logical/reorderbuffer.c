@@ -232,9 +232,7 @@ ReorderBufferAllocate(void)
 	/* allocate memory in own context, to have better accountability */
 	new_ctx = AllocSetContextCreate(CurrentMemoryContext,
 									"ReorderBuffer",
-									ALLOCSET_DEFAULT_MINSIZE,
-									ALLOCSET_DEFAULT_INITSIZE,
-									ALLOCSET_DEFAULT_MAXSIZE);
+									ALLOCSET_DEFAULT_SIZES);
 
 	buffer =
 		(ReorderBuffer *) MemoryContextAlloc(new_ctx, sizeof(ReorderBuffer));
@@ -466,8 +464,8 @@ ReorderBufferGetTupleBuf(ReorderBuffer *rb, Size tuple_len)
 	/*
 	 * Most tuples are below MaxHeapTupleSize, so we use a slab allocator for
 	 * those. Thus always allocate at least MaxHeapTupleSize. Note that tuples
-	 * tuples generated for oldtuples can be bigger, as they don't have
-	 * out-of-line toast columns.
+	 * generated for oldtuples can be bigger, as they don't have out-of-line
+	 * toast columns.
 	 */
 	if (alloc_len < MaxHeapTupleSize)
 		alloc_len = MaxHeapTupleSize;
@@ -563,7 +561,7 @@ ReorderBufferTXNByXid(ReorderBuffer *rb, TransactionId xid, bool create,
 		}
 
 		/*
-		 * cached as non-existant, and asked not to create? Then nothing else
+		 * cached as non-existent, and asked not to create? Then nothing else
 		 * to do.
 		 */
 		if (!create)
@@ -666,8 +664,8 @@ ReorderBufferQueueMessage(ReorderBuffer *rb, TransactionId xid,
 	}
 	else
 	{
-		ReorderBufferTXN   *txn = NULL;
-		volatile Snapshot	snapshot_now = snapshot;
+		ReorderBufferTXN *txn = NULL;
+		volatile Snapshot snapshot_now = snapshot;
 
 		if (xid != InvalidTransactionId)
 			txn = ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
@@ -807,13 +805,14 @@ ReorderBufferCommitChild(ReorderBuffer *rb, TransactionId xid,
 		elog(ERROR, "subxact logged without previous toplevel record");
 
 	/*
-	 * Pass the our base snapshot to the parent transaction if it doesn't have
+	 * Pass our base snapshot to the parent transaction if it doesn't have
 	 * one, or ours is older. That can happen if there are no changes in the
 	 * toplevel transaction but in one of the child transactions. This allows
-	 * the parent to simply use it's base snapshot initially.
+	 * the parent to simply use its base snapshot initially.
 	 */
-	if (txn->base_snapshot == NULL ||
-		txn->base_snapshot_lsn > subtxn->base_snapshot_lsn)
+	if (subtxn->base_snapshot != NULL &&
+		(txn->base_snapshot == NULL ||
+		 txn->base_snapshot_lsn > subtxn->base_snapshot_lsn))
 	{
 		txn->base_snapshot = subtxn->base_snapshot;
 		txn->base_snapshot_lsn = subtxn->base_snapshot_lsn;
@@ -936,8 +935,12 @@ ReorderBufferIterTXNInit(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		ReorderBufferChange *cur_change;
 
 		if (txn->nentries != txn->nentries_mem)
+		{
+			/* serialize remaining changes */
+			ReorderBufferSerializeTXN(rb, txn);
 			ReorderBufferRestoreChanges(rb, txn, &state->entries[off].fd,
 										&state->entries[off].segno);
+		}
 
 		cur_change = dlist_head_element(ReorderBufferChange, node,
 										&txn->changes);
@@ -960,11 +963,14 @@ ReorderBufferIterTXNInit(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		{
 			ReorderBufferChange *cur_change;
 
-			if (txn->nentries != txn->nentries_mem)
+			if (cur_txn->nentries != cur_txn->nentries_mem)
+			{
+				/* serialize remaining changes */
+				ReorderBufferSerializeTXN(rb, cur_txn);
 				ReorderBufferRestoreChanges(rb, cur_txn,
 											&state->entries[off].fd,
 											&state->entries[off].segno);
-
+			}
 			cur_change = dlist_head_element(ReorderBufferChange, node,
 											&cur_txn->changes);
 
@@ -1159,17 +1165,15 @@ ReorderBufferCleanupTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		txn->base_snapshot_lsn = InvalidXLogRecPtr;
 	}
 
-	/* delete from list of known subxacts */
-	if (txn->is_known_as_subxact)
-	{
-		/* NB: nsubxacts count of parent will be too high now */
-		dlist_delete(&txn->node);
-	}
-	/* delete from LSN ordered list of toplevel TXNs */
-	else
-	{
-		dlist_delete(&txn->node);
-	}
+	/*
+	 * Remove TXN from its containing list.
+	 *
+	 * Note: if txn->is_known_as_subxact, we are deleting the TXN from its
+	 * parent's list of known subxacts; this leaves the parent's nsubxacts
+	 * count too high, but we don't care.  Otherwise, we are deleting the TXN
+	 * from the LSN-ordered list of toplevel TXNs.
+	 */
+	dlist_delete(&txn->node);
 
 	/* now remove reference from buffer */
 	hash_search(rb->by_txn,
@@ -1369,10 +1373,6 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 	txn->commit_time = commit_time;
 	txn->origin_id = origin_id;
 	txn->origin_lsn = origin_lsn;
-
-	/* serialize the last bunch of changes if we need start earlier anyway */
-	if (txn->nentries_mem != txn->nentries)
-		ReorderBufferSerializeTXN(rb, txn);
 
 	/*
 	 * If this transaction didn't have any real changes in our database, it's
@@ -1836,10 +1836,10 @@ ReorderBufferImmediateInvalidation(ReorderBuffer *rb, uint32 ninvalidations,
 		BeginInternalSubTransaction("replay");
 
 	/*
-	 * Force invalidations to happen outside of a valid transaction - that
-	 * way entries will just be marked as invalid without accessing the
-	 * catalog. That's advantageous because we don't need to setup the
-	 * full state necessary for catalog access.
+	 * Force invalidations to happen outside of a valid transaction - that way
+	 * entries will just be marked as invalid without accessing the catalog.
+	 * That's advantageous because we don't need to setup the full state
+	 * necessary for catalog access.
 	 */
 	if (use_subtxn)
 		AbortCurrentTransaction();
@@ -2253,6 +2253,9 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 				data = ((char *) rb->outbuf) + sizeof(ReorderBufferDiskChange);
 
+				/* might have been reallocated above */
+				ondisk = (ReorderBufferDiskChange *) rb->outbuf;
+
 				/* write the prefix including the size */
 				memcpy(data, &prefix_size, sizeof(Size));
 				data += sizeof(Size);
@@ -2316,7 +2319,10 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 	if (write(fd, rb->outbuf, ondisk->size) != ondisk->size)
 	{
+		int			save_errno = errno;
+
 		CloseTransientFile(fd);
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write to data file for XID %u: %m",
@@ -2543,14 +2549,14 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				change->data.msg.prefix = MemoryContextAlloc(rb->context,
 															 prefix_size);
 				memcpy(change->data.msg.prefix, data, prefix_size);
-				Assert(change->data.msg.prefix[prefix_size-1] == '\0');
+				Assert(change->data.msg.prefix[prefix_size - 1] == '\0');
 				data += prefix_size;
 
-				/* read the messsage */
+				/* read the message */
 				memcpy(&change->data.msg.message_size, data, sizeof(Size));
 				data += sizeof(Size);
 				change->data.msg.message = MemoryContextAlloc(rb->context,
-												change->data.msg.message_size);
+											  change->data.msg.message_size);
 				memcpy(change->data.msg.message, data,
 					   change->data.msg.message_size);
 				data += change->data.msg.message_size;
@@ -3069,7 +3075,8 @@ ApplyLogicalMappingFile(HTAB *tuplecid_data, Oid relid, const char *fname)
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY, 0);
 	if (fd < 0)
 		ereport(ERROR,
-				(errmsg("could not open file \"%s\": %m", path)));
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
 
 	while (true)
 	{

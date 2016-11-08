@@ -20,13 +20,16 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
 
+#include "common/ip.h"
+#include "common/md5.h"
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
-#include "libpq/ip.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
-#include "libpq/md5.h"
 #include "miscadmin.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
@@ -36,7 +39,8 @@
  * Global authentication functions
  *----------------------------------------------------------------
  */
-static void sendAuthRequest(Port *port, AuthRequest areq);
+static void sendAuthRequest(Port *port, AuthRequest areq, char *extradata,
+				int extralen);
 static void auth_failed(Port *port, int status, char *logdetail);
 static char *recv_password_packet(Port *port);
 static int	recv_and_check_password_packet(Port *port, char **logdetail);
@@ -498,7 +502,7 @@ ClientAuthentication(Port *port)
 
 		case uaGSS:
 #ifdef ENABLE_GSS
-			sendAuthRequest(port, AUTH_REQ_GSS);
+			sendAuthRequest(port, AUTH_REQ_GSS, NULL, 0);
 			status = pg_GSS_recvauth(port);
 #else
 			Assert(false);
@@ -507,7 +511,7 @@ ClientAuthentication(Port *port)
 
 		case uaSSPI:
 #ifdef ENABLE_SSPI
-			sendAuthRequest(port, AUTH_REQ_SSPI);
+			sendAuthRequest(port, AUTH_REQ_SSPI, NULL, 0);
 			status = pg_SSPI_recvauth(port);
 #else
 			Assert(false);
@@ -531,12 +535,13 @@ ClientAuthentication(Port *port)
 				ereport(FATAL,
 						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						 errmsg("MD5 authentication is not supported when \"db_user_namespace\" is enabled")));
-			sendAuthRequest(port, AUTH_REQ_MD5);
+			/* include the salt to use for computing the response */
+			sendAuthRequest(port, AUTH_REQ_MD5, port->md5Salt, 4);
 			status = recv_and_check_password_packet(port, &logdetail);
 			break;
 
 		case uaPassword:
-			sendAuthRequest(port, AUTH_REQ_PASSWORD);
+			sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
 			status = recv_and_check_password_packet(port, &logdetail);
 			break;
 
@@ -583,7 +588,7 @@ ClientAuthentication(Port *port)
 		(*ClientAuthentication_hook) (port, status);
 
 	if (status == STATUS_OK)
-		sendAuthRequest(port, AUTH_REQ_OK);
+		sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
 	else
 		auth_failed(port, status, logdetail);
 }
@@ -593,7 +598,7 @@ ClientAuthentication(Port *port)
  * Send an authentication request packet to the frontend.
  */
 static void
-sendAuthRequest(Port *port, AuthRequest areq)
+sendAuthRequest(Port *port, AuthRequest areq, char *extradata, int extralen)
 {
 	StringInfoData buf;
 
@@ -601,28 +606,8 @@ sendAuthRequest(Port *port, AuthRequest areq)
 
 	pq_beginmessage(&buf, 'R');
 	pq_sendint(&buf, (int32) areq, sizeof(int32));
-
-	/* Add the salt for encrypted passwords. */
-	if (areq == AUTH_REQ_MD5)
-		pq_sendbytes(&buf, port->md5Salt, 4);
-
-#if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
-
-	/*
-	 * Add the authentication data for the next step of the GSSAPI or SSPI
-	 * negotiation.
-	 */
-	else if (areq == AUTH_REQ_GSS_CONT)
-	{
-		if (port->gss->outbuf.length > 0)
-		{
-			elog(DEBUG4, "sending GSS token of length %u",
-				 (unsigned int) port->gss->outbuf.length);
-
-			pq_sendbytes(&buf, port->gss->outbuf.value, port->gss->outbuf.length);
-		}
-	}
-#endif
+	if (extralen > 0)
+		pq_sendbytes(&buf, extradata, extralen);
 
 	pq_endmessage(&buf);
 
@@ -934,7 +919,8 @@ pg_GSS_recvauth(Port *port)
 			elog(DEBUG4, "sending GSS response token of length %u",
 				 (unsigned int) port->gss->outbuf.length);
 
-			sendAuthRequest(port, AUTH_REQ_GSS_CONT);
+			sendAuthRequest(port, AUTH_REQ_GSS_CONT,
+							port->gss->outbuf.value, port->gss->outbuf.length);
 
 			gss_release_buffer(&lmin_s, &port->gss->outbuf);
 		}
@@ -1179,7 +1165,8 @@ pg_SSPI_recvauth(Port *port)
 			port->gss->outbuf.length = outbuf.pBuffers[0].cbBuffer;
 			port->gss->outbuf.value = outbuf.pBuffers[0].pvBuffer;
 
-			sendAuthRequest(port, AUTH_REQ_GSS_CONT);
+			sendAuthRequest(port, AUTH_REQ_GSS_CONT,
+							port->gss->outbuf.value, port->gss->outbuf.length);
 
 			FreeContextBuffer(outbuf.pBuffers[0].pvBuffer);
 		}
@@ -1807,7 +1794,7 @@ pam_passwd_conv_proc(int num_msg, const struct pam_message ** msg,
 					 * let's go ask the client to send a password, which we
 					 * then stuff into PAM.
 					 */
-					sendAuthRequest(pam_port_cludge, AUTH_REQ_PASSWORD);
+					sendAuthRequest(pam_port_cludge, AUTH_REQ_PASSWORD, NULL, 0);
 					passwd = recv_password_packet(pam_port_cludge);
 					if (passwd == NULL)
 					{
@@ -1875,7 +1862,7 @@ CheckPAMAuth(Port *port, char *user, char *password)
 
 	retval = pg_getnameinfo_all(&port->raddr.addr, port->raddr.salen,
 								hostinfo, sizeof(hostinfo), NULL, 0,
-								port->hba->pam_use_hostname ? 0 : NI_NUMERICHOST | NI_NUMERICSERV);
+		  port->hba->pam_use_hostname ? 0 : NI_NUMERICHOST | NI_NUMERICSERV);
 	if (retval != 0)
 	{
 		ereport(WARNING,
@@ -1934,7 +1921,7 @@ CheckPAMAuth(Port *port, char *user, char *password)
 	{
 		ereport(LOG,
 				(errmsg("pam_set_item(PAM_RHOST) failed: %s",
-					pam_strerror(pamh, retval))));
+						pam_strerror(pamh, retval))));
 		pam_passwd = NULL;
 		return STATUS_ERROR;
 	}
@@ -1996,8 +1983,8 @@ CheckPAMAuth(Port *port, char *user, char *password)
 static int
 CheckBSDAuth(Port *port, char *user)
 {
-	char *passwd;
-	int retval;
+	char	   *passwd;
+	int			retval;
 
 	/* Send regular password request to client, and get the response */
 	sendAuthRequest(port, AUTH_REQ_PASSWORD);
@@ -2137,7 +2124,7 @@ CheckLDAPAuth(Port *port)
 	if (port->hba->ldapport == 0)
 		port->hba->ldapport = LDAP_PORT;
 
-	sendAuthRequest(port, AUTH_REQ_PASSWORD);
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
 
 	passwd = recv_password_packet(port);
 	if (passwd == NULL)
@@ -2497,7 +2484,7 @@ CheckRADIUSAuth(Port *port)
 		identifier = port->hba->radiusidentifier;
 
 	/* Send regular password request to client, and get the response */
-	sendAuthRequest(port, AUTH_REQ_PASSWORD);
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
 
 	passwd = recv_password_packet(port);
 	if (passwd == NULL)
@@ -2539,11 +2526,10 @@ CheckRADIUSAuth(Port *port)
 	radius_add_attribute(packet, RADIUS_NAS_IDENTIFIER, (unsigned char *) identifier, strlen(identifier));
 
 	/*
-	 * RADIUS password attributes are calculated as:
-	 *   e[0] = p[0] XOR MD5(secret + Request Authenticator)
-	 * for the first group of 16 octets, and then:
-	 *   e[i] = p[i] XOR MD5(secret + e[i-1])
-	 * for the following ones (if necessary)
+	 * RADIUS password attributes are calculated as: e[0] = p[0] XOR
+	 * MD5(secret + Request Authenticator) for the first group of 16 octets,
+	 * and then: e[i] = p[i] XOR MD5(secret + e[i-1]) for the following ones
+	 * (if necessary)
 	 */
 	encryptedpasswordlen = ((strlen(passwd) + RADIUS_VECTOR_LENGTH - 1) / RADIUS_VECTOR_LENGTH) * RADIUS_VECTOR_LENGTH;
 	cryptvector = palloc(strlen(port->hba->radiussecret) + RADIUS_VECTOR_LENGTH);
@@ -2554,7 +2540,11 @@ CheckRADIUSAuth(Port *port)
 	for (i = 0; i < encryptedpasswordlen; i += RADIUS_VECTOR_LENGTH)
 	{
 		memcpy(cryptvector + strlen(port->hba->radiussecret), md5trailer, RADIUS_VECTOR_LENGTH);
-		/* .. and for subsequent iterations the result of the previous XOR (calculated below) */
+
+		/*
+		 * .. and for subsequent iterations the result of the previous XOR
+		 * (calculated below)
+		 */
 		md5trailer = encryptedpassword + i;
 
 		if (!pg_md5_binary(cryptvector, strlen(port->hba->radiussecret) + RADIUS_VECTOR_LENGTH, encryptedpassword + i))
@@ -2565,7 +2555,7 @@ CheckRADIUSAuth(Port *port)
 			return STATUS_ERROR;
 		}
 
-		for (j = i; j < i+RADIUS_VECTOR_LENGTH; j++)
+		for (j = i; j < i + RADIUS_VECTOR_LENGTH; j++)
 		{
 			if (j < strlen(passwd))
 				encryptedpassword[j] = passwd[j] ^ encryptedpassword[j];

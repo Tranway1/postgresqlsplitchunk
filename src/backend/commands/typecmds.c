@@ -111,7 +111,7 @@ static char *domainAddConstraint(Oid domainOid, Oid domainNamespace,
  *		Registers a new base type.
  */
 ObjectAddress
-DefineType(List *names, List *parameters)
+DefineType(ParseState *pstate, List *names, List *parameters)
 {
 	char	   *typeName;
 	Oid			typeNamespace;
@@ -286,13 +286,15 @@ DefineType(List *names, List *parameters)
 			ereport(WARNING,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("type attribute \"%s\" not recognized",
-							defel->defname)));
+							defel->defname),
+					 parser_errposition(pstate, defel->location)));
 			continue;
 		}
 		if (*defelp != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("conflicting or redundant options")));
+					 errmsg("conflicting or redundant options"),
+					 parser_errposition(pstate, defel->location)));
 		*defelp = defel;
 	}
 
@@ -450,8 +452,8 @@ DefineType(List *names, List *parameters)
 		{
 			/* backwards-compatibility hack */
 			ereport(WARNING,
-					(errmsg("changing return type of function %s from %s to %s",
-							NameListToString(inputName), "opaque", typeName)));
+				 (errmsg("changing return type of function %s from %s to %s",
+						 NameListToString(inputName), "opaque", typeName)));
 			SetFunctionReturnType(inputOid, typoid);
 		}
 		else
@@ -467,15 +469,15 @@ DefineType(List *names, List *parameters)
 		{
 			/* backwards-compatibility hack */
 			ereport(WARNING,
-					(errmsg("changing return type of function %s from %s to %s",
-							NameListToString(outputName), "opaque", "cstring")));
+				 (errmsg("changing return type of function %s from %s to %s",
+						 NameListToString(outputName), "opaque", "cstring")));
 			SetFunctionReturnType(outputOid, CSTRINGOID);
 		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			   errmsg("type output function %s must return type %s",
-					  NameListToString(outputName), "cstring")));
+					 errmsg("type output function %s must return type %s",
+							NameListToString(outputName), "cstring")));
 	}
 	if (receiveOid)
 	{
@@ -492,8 +494,8 @@ DefineType(List *names, List *parameters)
 		if (resulttype != BYTEAOID)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				   errmsg("type send function %s must return type %s",
-						  NameListToString(sendName), "bytea")));
+					 errmsg("type send function %s must return type %s",
+							NameListToString(sendName), "bytea")));
 	}
 
 	/*
@@ -1221,7 +1223,7 @@ DefineEnum(CreateEnumStmt *stmt)
  *		Adds a new label to an existing enum.
  */
 ObjectAddress
-AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
+AlterEnum(AlterEnumStmt *stmt)
 {
 	Oid			enum_type_oid;
 	TypeName   *typename;
@@ -1236,38 +1238,27 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for type %u", enum_type_oid);
 
-	/*
-	 * Ordinarily we disallow adding values within transaction blocks, because
-	 * we can't cope with enum OID values getting into indexes and then having
-	 * their defining pg_enum entries go away.  However, it's okay if the enum
-	 * type was created in the current transaction, since then there can be no
-	 * such indexes that wouldn't themselves go away on rollback.  (We support
-	 * this case because pg_dump --binary-upgrade needs it.)  We test this by
-	 * seeing if the pg_type row has xmin == current XID and is not
-	 * HEAP_UPDATED.  If it is HEAP_UPDATED, we can't be sure whether the type
-	 * was created or only modified in this xact.  So we are disallowing some
-	 * cases that could theoretically be safe; but fortunately pg_dump only
-	 * needs the simplest case.
-	 */
-	if (HeapTupleHeaderGetXmin(tup->t_data) == GetCurrentTransactionId() &&
-		!(tup->t_data->t_infomask & HEAP_UPDATED))
-		 /* safe to do inside transaction block */ ;
-	else
-		PreventTransactionChain(isTopLevel, "ALTER TYPE ... ADD");
-
 	/* Check it's an enum and check user has permission to ALTER the enum */
 	checkEnumOwner(tup);
 
-	/* Add the new label */
-	AddEnumLabel(enum_type_oid, stmt->newVal,
-				 stmt->newValNeighbor, stmt->newValIsAfter,
-				 stmt->skipIfExists);
+	ReleaseSysCache(tup);
+
+	if (stmt->oldVal)
+	{
+		/* Rename an existing label */
+		RenameEnumLabel(enum_type_oid, stmt->oldVal, stmt->newVal);
+	}
+	else
+	{
+		/* Add a new label */
+		AddEnumLabel(enum_type_oid, stmt->newVal,
+					 stmt->newValNeighbor, stmt->newValIsAfter,
+					 stmt->skipIfNewValExists);
+	}
 
 	InvokeObjectPostAlterHook(TypeRelationId, enum_type_oid, 0);
 
 	ObjectAddressSet(address, TypeRelationId, enum_type_oid);
-
-	ReleaseSysCache(tup);
 
 	return address;
 }
@@ -1888,8 +1879,8 @@ findTypeAnalyzeFunction(List *procname, Oid typeOid)
 	if (get_func_rettype(procOid) != BOOLOID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			  errmsg("type analyze function %s must return type %s",
-					 NameListToString(procname), "boolean")));
+				 errmsg("type analyze function %s must return type %s",
+						NameListToString(procname), "boolean")));
 
 	return procOid;
 }
@@ -3313,9 +3304,9 @@ AlterTypeOwner_oid(Oid typeOid, Oid newOwnerId, bool hasDependEntry)
 	typTup = (Form_pg_type) GETSTRUCT(tup);
 
 	/*
-	 * If it's a composite type, invoke ATExecChangeOwner so that we fix up the
-	 * pg_class entry properly.  That will call back to AlterTypeOwnerInternal
-	 * to take care of the pg_type entry(s).
+	 * If it's a composite type, invoke ATExecChangeOwner so that we fix up
+	 * the pg_class entry properly.  That will call back to
+	 * AlterTypeOwnerInternal to take care of the pg_type entry(s).
 	 */
 	if (typTup->typtype == TYPTYPE_COMPOSITE)
 		ATExecChangeOwner(typTup->typrelid, newOwnerId, true, AccessExclusiveLock);
@@ -3512,7 +3503,7 @@ AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 
 		/* check for duplicate name (more friendly than unique-index failure) */
 		if (SearchSysCacheExists2(TYPENAMENSP,
-								  CStringGetDatum(NameStr(typform->typname)),
+								  NameGetDatum(&typform->typname),
 								  ObjectIdGetDatum(nspOid)))
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),

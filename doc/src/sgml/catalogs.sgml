@@ -14,11 +14,13 @@
    tables.  You can drop and recreate the tables, add columns, insert
    and update values, and severely mess up your system that way.
    Normally, one should not change the system catalogs by hand, there
-   are always SQL commands to do that.  (For example, <command>CREATE
+   are normally SQL commands to do that.  (For example, <command>CREATE
    DATABASE</command> inserts a row into the
    <structname>pg_database</structname> catalog &mdash; and actually
    creates the database on disk.)  There are some exceptions for
-   particularly esoteric operations, such as adding index access methods.
+   particularly esoteric operations, but many of those have been made
+   available as SQL commands over time, and so the need for direct manipulation
+   of the system catalogs is ever decreasing.
   </para>
 
  <sect1 id="catalogs-overview">
@@ -239,23 +241,13 @@
      </row>
 
      <row>
-      <entry><link linkend="catalog-pg-rewrite"><structname>pg_rewrite</structname></link></entry>
-      <entry>query rewrite rules</entry>
-     </row>
-
-     <row>
       <entry><link linkend="catalog-pg-replication-origin"><structname>pg_replication_origin</structname></link></entry>
       <entry>registered replication origins</entry>
      </row>
 
      <row>
-      <entry><link linkend="catalog-pg-replication-origin-status"><structname>pg_replication_origin_status</structname></link></entry>
-      <entry>information about replication origins, including replication progress</entry>
-     </row>
-
-     <row>
-      <entry><link linkend="catalog-pg-replication-slots"><structname>pg_replication_slots</structname></link></entry>
-      <entry>replication slot information</entry>
+      <entry><link linkend="catalog-pg-rewrite"><structname>pg_rewrite</structname></link></entry>
+      <entry>query rewrite rules</entry>
      </row>
 
      <row>
@@ -472,12 +464,6 @@
       <entry>Data type of the aggregate function's internal transition (state) data</entry>
      </row>
      <row>
-      <entry><structfield>aggserialtype</structfield></entry>
-      <entry><type>oid</type></entry>
-      <entry><literal><link linkend="catalog-pg-type"><structname>pg_type</structname></link>.oid</literal></entry>
-      <entry>Return data type of the aggregate function's serialization function (zero if none)</entry>
-     </row>
-     <row>
       <entry><structfield>aggtransspace</structfield></entry>
       <entry><type>int4</type></entry>
       <entry></entry>
@@ -543,10 +529,11 @@
   </indexterm>
 
   <para>
-   The catalog <structname>pg_am</structname> stores information about index
-   access methods.  There is one row for each index access method supported by
-   the system.  The requirements for index access methods are discussed in
-   detail in <xref linkend="indexam">.
+   The catalog <structname>pg_am</structname> stores information about
+   relation access methods.  There is one row for each access method supported
+   by the system.
+   Currently, only indexes have access methods.  The requirements for index
+   access methods are discussed in detail in <xref linkend="indexam">.
   </para>
 
   <table>
@@ -587,9 +574,29 @@
       </entry>
      </row>
 
+     <row>
+      <entry><structfield>amtype</structfield></entry>
+      <entry><type>char</type></entry>
+      <entry></entry>
+      <entry>
+       Currently always <literal>i</literal> to indicate an index access
+       method; other values may be allowed in future
+      </entry>
+     </row>
     </tbody>
    </tgroup>
   </table>
+
+  <note>
+   <para>
+    Before <productname>PostgreSQL</> 9.6, <structname>pg_am</structname>
+    contained many additional columns representing properties of index access
+    methods.  That data is now only directly visible at the C code level.
+    However, <function>pg_index_column_has_property()</function> and related
+    functions have been added to allow SQL queries to inspect index access
+    method properties; see <xref linkend="functions-info-catalog-table">.
+   </para>
+  </note>
 
  </sect1>
 
@@ -3827,7 +3834,7 @@
   </para>
 
   <table>
-   <title><structname>pg_inherits</> Columns</title>
+   <title><structname>pg_init_privs</> Columns</title>
 
    <tgroup cols="4">
     <thead>
@@ -5208,6 +5215,54 @@
 
  </sect1>
 
+ <sect1 id="catalog-pg-replication-origin">
+  <title><structname>pg_replication_origin</structname></title>
+
+  <indexterm zone="catalog-pg-replication-origin">
+   <primary>pg_replication_origin</primary>
+  </indexterm>
+
+  <para>
+   The <structname>pg_replication_origin</structname> catalog contains
+   all replication origins created.  For more on replication origins
+   see <xref linkend="replication-origins">.
+  </para>
+
+  <table>
+
+   <title><structname>pg_replication_origin</structname> Columns</title>
+
+   <tgroup cols="4">
+    <thead>
+     <row>
+      <entry>Name</entry>
+      <entry>Type</entry>
+      <entry>References</entry>
+      <entry>Description</entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry><structfield>roident</structfield></entry>
+      <entry><type>Oid</type></entry>
+      <entry></entry>
+      <entry>A unique, cluster-wide identifier for the replication
+      origin. Should never leave the system.</entry>
+     </row>
+
+     <row>
+      <entry><structfield>roname</structfield></entry>
+      <entry><type>text</type></entry>
+      <entry></entry>
+      <entry>The external, user defined, name of a replication
+      origin.</entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+ </sect1>
+
  <sect1 id="catalog-pg-rewrite">
   <title><structname>pg_rewrite</structname></title>
 
@@ -5318,252 +5373,6 @@
    </para>
   </note>
 
- </sect1>
-
- <sect1 id="catalog-pg-replication-origin">
-  <title><structname>pg_replication_origin</structname></title>
-
-  <indexterm zone="catalog-pg-replication-origin">
-   <primary>pg_replication_origin</primary>
-  </indexterm>
-
-  <para>
-   The <structname>pg_replication_origin</structname> catalog contains
-   all replication origins created.  For more on replication origins
-   see <xref linkend="replication-origins">.
-  </para>
-
-  <table>
-
-   <title><structname>pg_replication_origin</structname> Columns</title>
-
-   <tgroup cols="4">
-    <thead>
-     <row>
-      <entry>Name</entry>
-      <entry>Type</entry>
-      <entry>References</entry>
-      <entry>Description</entry>
-     </row>
-    </thead>
-
-    <tbody>
-     <row>
-      <entry><structfield>roident</structfield></entry>
-      <entry><type>Oid</type></entry>
-      <entry></entry>
-      <entry>A unique, cluster-wide identifier for the replication
-      origin. Should never leave the system.</entry>
-     </row>
-
-     <row>
-      <entry><structfield>roname</structfield></entry>
-      <entry><type>text</type></entry>
-      <entry></entry>
-      <entry>The external, user defined, name of a replication
-      origin.</entry>
-     </row>
-    </tbody>
-   </tgroup>
-  </table>
- </sect1>
-
-  <sect1 id="catalog-pg-replication-origin-status">
-  <title><structname>pg_replication_origin_status</structname></title>
-
-  <indexterm zone="catalog-pg-replication-origin-status">
-   <primary>pg_replication_origin_status</primary>
-  </indexterm>
-
-  <para>
-   The <structname>pg_replication_origin_status</structname> view
-   contains information about how far replay for a certain origin has
-   progressed.  For more on replication origins
-   see <xref linkend="replication-origins">.
-  </para>
-
-  <table>
-
-   <title><structname>pg_replication_origin_status</structname> Columns</title>
-
-   <tgroup cols="4">
-    <thead>
-     <row>
-      <entry>Name</entry>
-      <entry>Type</entry>
-      <entry>References</entry>
-      <entry>Description</entry>
-     </row>
-    </thead>
-
-    <tbody>
-     <row>
-      <entry><structfield>local_id</structfield></entry>
-      <entry><type>Oid</type></entry>
-      <entry><literal><link linkend="catalog-pg-replication-origin"><structname>pg_replication_origin</structname></link>.roident</literal></entry>
-      <entry>internal node identifier</entry>
-     </row>
-
-     <row>
-      <entry><structfield>external_id</structfield></entry>
-      <entry><type>text</type></entry>
-      <entry><literal><link linkend="catalog-pg-replication-origin"><structname>pg_replication_origin</structname></link>.roname</literal></entry>
-      <entry>external node identifier</entry>
-     </row>
-
-     <row>
-      <entry><structfield>remote_lsn</structfield></entry>
-      <entry><type>pg_lsn</type></entry>
-      <entry></entry>
-      <entry>The origin node's LSN up to which data has been replicated.</entry>
-     </row>
-
-
-     <row>
-      <entry><structfield>local_lsn</structfield></entry>
-      <entry><type>pg_lsn</type></entry>
-      <entry></entry>
-      <entry>
-       This node's LSN at which <literal>remote_lsn</literal> has
-       been replicated. Used to flush commit records before persisting
-       data to disk when using asynchronous commits.
-      </entry>
-     </row>
-    </tbody>
-   </tgroup>
-  </table>
- </sect1>
-
- <sect1 id="catalog-pg-replication-slots">
-  <title><structname>pg_replication_slots</structname></title>
-
-  <indexterm zone="catalog-pg-replication-slots">
-   <primary>pg_replication_slots</primary>
-  </indexterm>
-
-  <para>
-   The <structname>pg_replication_slots</structname> view provides a listing
-   of all replication slots that currently exist on the database cluster,
-   along with their current state.
-  </para>
-
-  <para>
-   For more on replication slots,
-   see <xref linkend="streaming-replication-slots"> and <xref linkend="logicaldecoding">.
-  </para>
-
-  <table>
-
-   <title><structname>pg_replication_slots</structname> Columns</title>
-
-   <tgroup cols="4">
-    <thead>
-     <row>
-      <entry>Name</entry>
-      <entry>Type</entry>
-      <entry>References</entry>
-      <entry>Description</entry>
-     </row>
-    </thead>
-
-    <tbody>
-     <row>
-      <entry><structfield>slot_name</structfield></entry>
-      <entry><type>name</type></entry>
-      <entry></entry>
-      <entry>A unique, cluster-wide identifier for the replication slot</entry>
-     </row>
-
-     <row>
-      <entry><structfield>plugin</structfield></entry>
-      <entry><type>name</type></entry>
-      <entry></entry>
-      <entry>The base name of the shared object containing the output plugin this logical slot is using, or null for physical slots.</entry>
-     </row>
-
-     <row>
-      <entry><structfield>slot_type</structfield></entry>
-      <entry><type>text</type></entry>
-      <entry></entry>
-      <entry>The slot type - <literal>physical</> or <literal>logical</></entry>
-     </row>
-
-     <row>
-      <entry><structfield>datoid</structfield></entry>
-      <entry><type>oid</type></entry>
-      <entry><literal><link linkend="catalog-pg-database"><structname>pg_database</structname></link>.oid</literal></entry>
-      <entry>The OID of the database this slot is associated with, or
-      null. Only logical slots have an associated database.</entry>
-     </row>
-
-     <row>
-      <entry><structfield>database</structfield></entry>
-      <entry><type>text</type></entry>
-      <entry><literal><link linkend="catalog-pg-database"><structname>pg_database</structname></link>.datname</literal></entry>
-      <entry>The name of the database this slot is associated with, or
-      null. Only logical slots have an associated database.</entry>
-     </row>
-
-     <row>
-      <entry><structfield>active</structfield></entry>
-      <entry><type>boolean</type></entry>
-      <entry></entry>
-      <entry>True if this slot is currently actively being used</entry>
-     </row>
-
-     <row>
-      <entry><structfield>active_pid</structfield></entry>
-      <entry><type>integer</type></entry>
-      <entry></entry>
-      <entry>The process ID of the session using this slot if the slot
-       is currently actively being used. <literal>NULL</literal> if
-       inactive.
-      </entry>
-     </row>
-
-     <row>
-      <entry><structfield>xmin</structfield></entry>
-      <entry><type>xid</type></entry>
-      <entry></entry>
-      <entry>The oldest transaction that this slot needs the database to
-      retain.  <literal>VACUUM</literal> cannot remove tuples deleted
-      by any later transaction.
-      </entry>
-     </row>
-
-     <row>
-      <entry><structfield>catalog_xmin</structfield></entry>
-      <entry><type>xid</type></entry>
-      <entry></entry>
-      <entry>The oldest transaction affecting the system catalogs that this
-      slot needs the database to retain.  <literal>VACUUM</literal> cannot
-      remove catalog tuples deleted by any later transaction.
-      </entry>
-     </row>
-
-     <row>
-      <entry><structfield>restart_lsn</structfield></entry>
-      <entry><type>pg_lsn</type></entry>
-      <entry></entry>
-      <entry>The address (<literal>LSN</literal>) of oldest WAL which still
-      might be required by the consumer of this slot and thus won't be
-      automatically removed during checkpoints.
-      </entry>
-     </row>
-
-     <row>
-      <entry><structfield>confirmed_flush_lsn</structfield></entry>
-      <entry><type>pg_lsn</type></entry>
-      <entry></entry>
-      <entry>The address (<literal>LSN</literal>) up to which the logical
-      slot's consumer has confirmed receiving data. Data older than this is
-      not available anymore. <literal>NULL</> for physical slots.
-      </entry>
-     </row>
-
-    </tbody>
-   </tgroup>
-  </table>
  </sect1>
 
  <sect1 id="catalog-pg-seclabel">
@@ -6061,9 +5870,9 @@
       <entry>The number of distinct nonnull data values in the column.
       A value greater than zero is the actual number of distinct values.
       A value less than zero is the negative of a multiplier for the number
-      of rows in the table; for example, a column in which values appear about
-      twice on the average could be represented by
-      <structfield>stadistinct</> = -0.5.
+      of rows in the table; for example, a column in which about 80% of the
+      values are nonnull and each nonnull value appears about twice on
+      average could be represented by <structfield>stadistinct</> = -0.4.
       A zero value means the number of distinct values is unknown.
       </entry>
      </row>
@@ -6421,6 +6230,22 @@
       <entry>Expression tree (in <function>nodeToString()</function>
        representation) for the trigger's <literal>WHEN</> condition, or null
        if none</entry>
+     </row>
+
+     <row>
+      <entry><structfield>tgoldtable</structfield></entry>
+      <entry><type>name</type></entry>
+      <entry></entry>
+      <entry><literal>REFERENCING</> clause name for <literal>OLD TABLE</>,
+       or null if none</entry>
+     </row>
+
+     <row>
+      <entry><structfield>tgnewtable</structfield></entry>
+      <entry><type>name</type></entry>
+      <entry></entry>
+      <entry><literal>REFERENCING</> clause name for <literal>NEW TABLE</>,
+       or null if none</entry>
      </row>
     </tbody>
    </tgroup>
@@ -7545,6 +7370,16 @@
      </row>
 
      <row>
+      <entry><link linkend="view-pg-replication-origin-status"><structname>pg_replication_origin_status</structname></link></entry>
+      <entry>information about replication origins, including replication progress</entry>
+     </row>
+
+     <row>
+      <entry><link linkend="view-pg-replication-slots"><structname>pg_replication_slots</structname></link></entry>
+      <entry>replication slot information</entry>
+     </row>
+
+     <row>
       <entry><link linkend="view-pg-roles"><structname>pg_roles</structname></link></entry>
       <entry>database roles</entry>
      </row>
@@ -7773,8 +7608,13 @@
    be used by software packages that want to interface to
    <productname>PostgreSQL</> to facilitate finding the required header
    files and libraries. It provides the same basic information as the
-   <xref linkend="app-pgconfig"> <productname>PostgreSQL</> Client
-   Application.
+   <xref linkend="app-pgconfig"> <productname>PostgreSQL</> client
+   application.
+  </para>
+
+  <para>
+   By default, the <structname>pg_config</structname> view can be read
+   only by superusers.
   </para>
 
   <table>
@@ -7952,8 +7792,8 @@
   </para>
 
   <para>
-   The <structname>pg_file_settings</structname> view can be read only by
-   superusers.
+   By default, the <structname>pg_file_settings</structname> view can be read
+   only by superusers.
   </para>
 
   <table>
@@ -8698,7 +8538,7 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
       <entry><type>boolean</type></entry>
       <entry>
        <literal>true</literal> if the prepared statement was created
-       via the <command>PREPARE</command> SQL statement;
+       via the <command>PREPARE</command> SQL command;
        <literal>false</literal> if the statement was prepared via the
        frontend/backend protocol
       </entry>
@@ -8798,6 +8638,203 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
    frequently accessed.
   </para>
 
+ </sect1>
+
+  <sect1 id="view-pg-replication-origin-status">
+  <title><structname>pg_replication_origin_status</structname></title>
+
+  <indexterm zone="view-pg-replication-origin-status">
+   <primary>pg_replication_origin_status</primary>
+  </indexterm>
+
+  <para>
+   The <structname>pg_replication_origin_status</structname> view
+   contains information about how far replay for a certain origin has
+   progressed.  For more on replication origins
+   see <xref linkend="replication-origins">.
+  </para>
+
+  <table>
+
+   <title><structname>pg_replication_origin_status</structname> Columns</title>
+
+   <tgroup cols="4">
+    <thead>
+     <row>
+      <entry>Name</entry>
+      <entry>Type</entry>
+      <entry>References</entry>
+      <entry>Description</entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry><structfield>local_id</structfield></entry>
+      <entry><type>Oid</type></entry>
+      <entry><literal><link linkend="catalog-pg-replication-origin"><structname>pg_replication_origin</structname></link>.roident</literal></entry>
+      <entry>internal node identifier</entry>
+     </row>
+
+     <row>
+      <entry><structfield>external_id</structfield></entry>
+      <entry><type>text</type></entry>
+      <entry><literal><link linkend="catalog-pg-replication-origin"><structname>pg_replication_origin</structname></link>.roname</literal></entry>
+      <entry>external node identifier</entry>
+     </row>
+
+     <row>
+      <entry><structfield>remote_lsn</structfield></entry>
+      <entry><type>pg_lsn</type></entry>
+      <entry></entry>
+      <entry>The origin node's LSN up to which data has been replicated.</entry>
+     </row>
+
+     <row>
+      <entry><structfield>local_lsn</structfield></entry>
+      <entry><type>pg_lsn</type></entry>
+      <entry></entry>
+      <entry>
+       This node's LSN at which <literal>remote_lsn</literal> has
+       been replicated. Used to flush commit records before persisting
+       data to disk when using asynchronous commits.
+      </entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+ </sect1>
+
+ <sect1 id="view-pg-replication-slots">
+  <title><structname>pg_replication_slots</structname></title>
+
+  <indexterm zone="view-pg-replication-slots">
+   <primary>pg_replication_slots</primary>
+  </indexterm>
+
+  <para>
+   The <structname>pg_replication_slots</structname> view provides a listing
+   of all replication slots that currently exist on the database cluster,
+   along with their current state.
+  </para>
+
+  <para>
+   For more on replication slots,
+   see <xref linkend="streaming-replication-slots"> and <xref linkend="logicaldecoding">.
+  </para>
+
+  <table>
+
+   <title><structname>pg_replication_slots</structname> Columns</title>
+
+   <tgroup cols="4">
+    <thead>
+     <row>
+      <entry>Name</entry>
+      <entry>Type</entry>
+      <entry>References</entry>
+      <entry>Description</entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry><structfield>slot_name</structfield></entry>
+      <entry><type>name</type></entry>
+      <entry></entry>
+      <entry>A unique, cluster-wide identifier for the replication slot</entry>
+     </row>
+
+     <row>
+      <entry><structfield>plugin</structfield></entry>
+      <entry><type>name</type></entry>
+      <entry></entry>
+      <entry>The base name of the shared object containing the output plugin this logical slot is using, or null for physical slots.</entry>
+     </row>
+
+     <row>
+      <entry><structfield>slot_type</structfield></entry>
+      <entry><type>text</type></entry>
+      <entry></entry>
+      <entry>The slot type - <literal>physical</> or <literal>logical</></entry>
+     </row>
+
+     <row>
+      <entry><structfield>datoid</structfield></entry>
+      <entry><type>oid</type></entry>
+      <entry><literal><link linkend="catalog-pg-database"><structname>pg_database</structname></link>.oid</literal></entry>
+      <entry>The OID of the database this slot is associated with, or
+      null. Only logical slots have an associated database.</entry>
+     </row>
+
+     <row>
+      <entry><structfield>database</structfield></entry>
+      <entry><type>text</type></entry>
+      <entry><literal><link linkend="catalog-pg-database"><structname>pg_database</structname></link>.datname</literal></entry>
+      <entry>The name of the database this slot is associated with, or
+      null. Only logical slots have an associated database.</entry>
+     </row>
+
+     <row>
+      <entry><structfield>active</structfield></entry>
+      <entry><type>boolean</type></entry>
+      <entry></entry>
+      <entry>True if this slot is currently actively being used</entry>
+     </row>
+
+     <row>
+      <entry><structfield>active_pid</structfield></entry>
+      <entry><type>integer</type></entry>
+      <entry></entry>
+      <entry>The process ID of the session using this slot if the slot
+       is currently actively being used. <literal>NULL</literal> if
+       inactive.
+      </entry>
+     </row>
+
+     <row>
+      <entry><structfield>xmin</structfield></entry>
+      <entry><type>xid</type></entry>
+      <entry></entry>
+      <entry>The oldest transaction that this slot needs the database to
+      retain.  <literal>VACUUM</literal> cannot remove tuples deleted
+      by any later transaction.
+      </entry>
+     </row>
+
+     <row>
+      <entry><structfield>catalog_xmin</structfield></entry>
+      <entry><type>xid</type></entry>
+      <entry></entry>
+      <entry>The oldest transaction affecting the system catalogs that this
+      slot needs the database to retain.  <literal>VACUUM</literal> cannot
+      remove catalog tuples deleted by any later transaction.
+      </entry>
+     </row>
+
+     <row>
+      <entry><structfield>restart_lsn</structfield></entry>
+      <entry><type>pg_lsn</type></entry>
+      <entry></entry>
+      <entry>The address (<literal>LSN</literal>) of oldest WAL which still
+      might be required by the consumer of this slot and thus won't be
+      automatically removed during checkpoints.
+      </entry>
+     </row>
+
+     <row>
+      <entry><structfield>confirmed_flush_lsn</structfield></entry>
+      <entry><type>pg_lsn</type></entry>
+      <entry></entry>
+      <entry>The address (<literal>LSN</literal>) up to which the logical
+      slot's consumer has confirmed receiving data. Data older than this is
+      not available anymore. <literal>NULL</> for physical slots.
+      </entry>
+     </row>
+
+    </tbody>
+   </tgroup>
+  </table>
  </sect1>
 
  <sect1 id="view-pg-roles">
@@ -8915,6 +8952,16 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
       <entry></entry>
       <entry>Password expiry time (only used for password authentication);
        null if no expiration</entry>
+     </row>
+
+     <row>
+      <entry><structfield>rolbypassrls</structfield></entry>
+      <entry><type>bool</type></entry>
+      <entry></entry>
+      <entry>
+       Role bypasses every row level security policy, see
+       <xref linkend="ddl-rowsecurity"> for more information.
+      </entry>
      </row>
 
      <row>
@@ -9785,6 +9832,13 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
    </tgroup>
   </table>
 
+  <para>
+   While most timezone abbreviations represent fixed offsets from UTC,
+   there are some that have historically varied in value
+   (see <xref linkend="datetime-config-files"> for more information).
+   In such cases this view presents their current meaning.
+  </para>
+
  </sect1>
 
  <sect1 id="view-pg-timezone-names">
@@ -9799,8 +9853,8 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
    of time zone names that are recognized by <command>SET TIMEZONE</>,
    along with their associated abbreviations, UTC offsets,
    and daylight-savings status.  (Technically,
-   <productname>PostgreSQL</productname> uses <acronym>UT1</> rather
-   than UTC because leap seconds are not handled.)
+   <productname>PostgreSQL</productname> does not use UTC because leap
+   seconds are not handled.)
    Unlike the abbreviations shown in <link
    linkend="view-pg-timezone-abbrevs"><structname>pg_timezone_abbrevs</structname></link>, many of these names imply a set of daylight-savings transition
    date rules.  Therefore, the associated information changes across local DST

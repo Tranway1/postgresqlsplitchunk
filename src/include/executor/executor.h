@@ -140,7 +140,7 @@ extern void execTuplesHashPrepare(int numCols,
 extern TupleHashTable BuildTupleHashTable(int numCols, AttrNumber *keyColIdx,
 					FmgrInfo *eqfunctions,
 					FmgrInfo *hashfunctions,
-					long nbuckets, Size entrysize,
+					long nbuckets, Size additionalsize,
 					MemoryContext tablecxt,
 					MemoryContext tempcxt);
 extern TupleHashEntry LookupTupleHashEntry(TupleHashTable hashtable,
@@ -284,7 +284,7 @@ typedef struct TupOutputState
 extern TupOutputState *begin_tup_output_tupdesc(DestReceiver *dest,
 						 TupleDesc tupdesc);
 extern void do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull);
-extern void do_text_output_multiline(TupOutputState *tstate, char *text);
+extern void do_text_output_multiline(TupOutputState *tstate, const char *txt);
 extern void end_tup_output(TupOutputState *tstate);
 
 /*

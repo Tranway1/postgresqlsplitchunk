@@ -17,6 +17,7 @@
 #include "access/xact.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/latch.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -486,17 +487,17 @@ pgfdw_get_result(PGconn *conn, const char *query)
 
 	for (;;)
 	{
-		PGresult *res;
+		PGresult   *res;
 
 		while (PQisBusy(conn))
 		{
-			int		wc;
+			int			wc;
 
 			/* Sleep until there's something to do */
 			wc = WaitLatchOrSocket(MyLatch,
 								   WL_LATCH_SET | WL_SOCKET_READABLE,
 								   PQsocket(conn),
-								   -1L);
+								   -1L, PG_WAIT_EXTENSION);
 			ResetLatch(MyLatch);
 
 			CHECK_FOR_INTERRUPTS();
@@ -675,10 +676,9 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					/*
 					 * If a command has been submitted to the remote server by
 					 * using an asynchronous execution function, the command
-					 * might not have yet completed.  Check to see if a command
-					 * is still being processed by the remote server, and if so,
-					 * request cancellation of the command; if not, abort
-					 * gracefully.
+					 * might not have yet completed.  Check to see if a
+					 * command is still being processed by the remote server,
+					 * and if so, request cancellation of the command.
 					 */
 					if (PQtransactionStatus(entry->conn) == PQTRANS_ACTIVE)
 					{
@@ -690,11 +690,10 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 							if (!PQcancel(cancel, errbuf, sizeof(errbuf)))
 								ereport(WARNING,
 										(errcode(ERRCODE_CONNECTION_FAILURE),
-										 errmsg("could not send cancel request: %s",
-												errbuf)));
+								  errmsg("could not send cancel request: %s",
+										 errbuf)));
 							PQfreeCancel(cancel);
 						}
-						break;
 					}
 
 					/* If we're aborting, abort all remote transactions too */
@@ -798,6 +797,30 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		{
 			/* Assume we might have lost track of prepared statements */
 			entry->have_error = true;
+
+			/*
+			 * If a command has been submitted to the remote server by using
+			 * an asynchronous execution function, the command might not have
+			 * yet completed.  Check to see if a command is still being
+			 * processed by the remote server, and if so, request cancellation
+			 * of the command.
+			 */
+			if (PQtransactionStatus(entry->conn) == PQTRANS_ACTIVE)
+			{
+				PGcancel   *cancel;
+				char		errbuf[256];
+
+				if ((cancel = PQgetCancel(entry->conn)))
+				{
+					if (!PQcancel(cancel, errbuf, sizeof(errbuf)))
+						ereport(WARNING,
+								(errcode(ERRCODE_CONNECTION_FAILURE),
+								 errmsg("could not send cancel request: %s",
+										errbuf)));
+					PQfreeCancel(cancel);
+				}
+			}
+
 			/* Rollback all remote subtransactions during abort */
 			snprintf(sql, sizeof(sql),
 					 "ROLLBACK TO SAVEPOINT s%d; RELEASE SAVEPOINT s%d",

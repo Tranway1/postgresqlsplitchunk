@@ -19,6 +19,7 @@
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
+#include "storage/proclist_types.h"
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
@@ -84,7 +85,7 @@ struct PGPROC
 {
 	/* proc->links MUST BE FIRST IN STRUCT (see ProcSleep,ProcWakeup,etc) */
 	SHM_QUEUE	links;			/* list link if process is in a list */
-	PGPROC	  **procgloballist;	/* procglobal list that owns this PGPROC */
+	PGPROC	  **procgloballist; /* procglobal list that owns this PGPROC */
 
 	PGSemaphoreData sem;		/* ONE semaphore to sleep on */
 	int			waitStatus;		/* STATUS_WAITING, STATUS_OK or STATUS_ERROR */
@@ -112,7 +113,7 @@ struct PGPROC
 	/* Info about LWLock the process is currently waiting for, if any. */
 	bool		lwWaiting;		/* true if waiting for an LW lock */
 	uint8		lwWaitMode;		/* lwlock mode being waited for */
-	dlist_node	lwWaitLink;		/* position in LW lock wait list */
+	proclist_node lwWaitLink;	/* position in LW lock wait list */
 
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
@@ -143,16 +144,17 @@ struct PGPROC
 
 	/* Support for group XID clearing. */
 	/* true, if member of ProcArray group waiting for XID clear */
-	bool			procArrayGroupMember;
+	bool		procArrayGroupMember;
 	/* next ProcArray group member waiting for XID clear */
-	pg_atomic_uint32	procArrayGroupNext;
+	pg_atomic_uint32 procArrayGroupNext;
+
 	/*
 	 * latest transaction id among the transaction's main XID and
 	 * subtransactions
 	 */
-	TransactionId	procArrayGroupMemberXid;
+	TransactionId procArrayGroupMemberXid;
 
-	uint32          wait_event_info;        /* proc's wait information */
+	uint32		wait_event_info;	/* proc's wait information */
 
 	/* Per-backend LWLock.  Protects fields below (but not group fields). */
 	LWLock		backendLock;
@@ -169,8 +171,8 @@ struct PGPROC
 	 * leader to get the LWLock protecting these fields.
 	 */
 	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
-	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
-	dlist_node  lockGroupLink;		/* my member link, if I'm a member */
+	dlist_head	lockGroupMembers;		/* list of members, if I'm a leader */
+	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
@@ -242,6 +244,9 @@ extern PROC_HDR *ProcGlobal;
 
 extern PGPROC *PreparedXactProcs;
 
+/* Accessor for PGPROC given a pgprocno. */
+#define GetPGProcByNumber(n) (&ProcGlobal->allProcs[(n)])
+
 /*
  * We set aside some extra PGPROC structures for auxiliary processes,
  * ie things that aren't full-fledged backends but need shmem access.
@@ -286,7 +291,7 @@ extern void CheckDeadLockAlert(void);
 extern bool IsWaitingForLock(void);
 extern void LockErrorCleanup(void);
 
-extern void ProcWaitForSignal(void);
+extern void ProcWaitForSignal(uint32 wait_event_info);
 extern void ProcSendSignal(int pid);
 
 extern void BecomeLockGroupLeader(void);

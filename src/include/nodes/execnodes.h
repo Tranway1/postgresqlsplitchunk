@@ -20,6 +20,7 @@
 #include "lib/pairingheap.h"
 #include "nodes/params.h"
 #include "nodes/plannodes.h"
+#include "utils/hsearch.h"
 #include "utils/reltrigger.h"
 #include "utils/sortsupport.h"
 #include "utils/tuplestore.h"
@@ -498,14 +499,23 @@ typedef struct TupleHashTableData *TupleHashTable;
 
 typedef struct TupleHashEntryData
 {
-	/* firstTuple must be the first field in this struct! */
 	MinimalTuple firstTuple;	/* copy of first tuple in this group */
-	/* there may be additional data beyond the end of this struct */
-} TupleHashEntryData;			/* VARIABLE LENGTH STRUCT */
+	void	   *additional;		/* user data */
+	uint32		status;			/* hash status */
+	uint32		hash;			/* hash value (cached) */
+} TupleHashEntryData;
+
+/* define paramters necessary to generate the tuple hash table interface */
+#define SH_PREFIX tuplehash
+#define SH_ELEMENT_TYPE TupleHashEntryData
+#define SH_KEY_TYPE MinimalTuple
+#define SH_SCOPE extern
+#define SH_DECLARE
+#include "lib/simplehash.h"
 
 typedef struct TupleHashTableData
 {
-	HTAB	   *hashtab;		/* underlying dynahash table */
+	tuplehash_hash *hashtab;	/* underlying hash table */
 	int			numCols;		/* number of columns in lookup key */
 	AttrNumber *keyColIdx;		/* attr numbers of key columns */
 	FmgrInfo   *tab_hash_funcs; /* hash functions for table datatype(s) */
@@ -520,7 +530,7 @@ typedef struct TupleHashTableData
 	FmgrInfo   *cur_eq_funcs;	/* equality functions for input vs. table */
 }	TupleHashTableData;
 
-typedef HASH_SEQ_STATUS TupleHashIterator;
+typedef tuplehash_iterator TupleHashIterator;
 
 /*
  * Use InitTupleHashIterator/TermTupleHashIterator for a read/write scan.
@@ -528,16 +538,13 @@ typedef HASH_SEQ_STATUS TupleHashIterator;
  * explicit scan termination is needed).
  */
 #define InitTupleHashIterator(htable, iter) \
-	hash_seq_init(iter, (htable)->hashtab)
+	tuplehash_start_iterate(htable->hashtab, iter)
 #define TermTupleHashIterator(iter) \
-	hash_seq_term(iter)
+	((void) 0)
 #define ResetTupleHashIterator(htable, iter) \
-	do { \
-		hash_freeze((htable)->hashtab); \
-		hash_seq_init(iter, (htable)->hashtab); \
-	} while (0)
-#define ScanTupleHashTable(iter) \
-	((TupleHashEntry) hash_seq_search(iter))
+	InitTupleHashIterator(htable, iter)
+#define ScanTupleHashTable(htable, iter) \
+	tuplehash_iterate(htable->hashtab, iter)
 
 
 /* ----------------------------------------------------------------
@@ -1031,7 +1038,7 @@ typedef struct PlanState
 								 * top-level plan */
 
 	Instrumentation *instrument;	/* Optional runtime stats for this node */
-	WorkerInstrumentation *worker_instrument; /* per-worker instrumentation */
+	WorkerInstrumentation *worker_instrument;	/* per-worker instrumentation */
 
 	/*
 	 * Common structural data for all Plan types.  These links to subsidiary
@@ -1586,7 +1593,7 @@ typedef struct WorkTableScanState
 typedef struct ForeignScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
-	List	   *fdw_recheck_quals;	/* original quals not in ss.ps.qual */
+	List	   *fdw_recheck_quals;		/* original quals not in ss.ps.qual */
 	Size		pscan_len;		/* size of parallel coordination information */
 	/* use struct pointer to avoid including fdwapi.h here */
 	struct FdwRoutine *fdwroutine;
@@ -1611,7 +1618,8 @@ struct CustomExecMethods;
 typedef struct CustomScanState
 {
 	ScanState	ss;
-	uint32		flags;			/* mask of CUSTOMPATH_* flags, see relation.h */
+	uint32		flags;			/* mask of CUSTOMPATH_* flags, see
+								 * nodes/extensible.h */
 	List	   *custom_ps;		/* list of child PlanState nodes, if any */
 	Size		pscan_len;		/* size of parallel coordination information */
 	const struct CustomExecMethods *methods;
@@ -1790,7 +1798,7 @@ typedef struct SortState
 
 /* ---------------------
  *	GroupState information
- * -------------------------
+ * ---------------------
  */
 typedef struct GroupState
 {
@@ -1809,7 +1817,7 @@ typedef struct GroupState
  *	input group during evaluation of an Agg node's output tuple(s).  We
  *	create a second ExprContext, tmpcontext, in which to evaluate input
  *	expressions and run the aggregate transition functions.
- * -------------------------
+ * ---------------------
  */
 /* these structs are private in nodeAgg.c: */
 typedef struct AggStatePerAggData *AggStatePerAgg;
@@ -1823,6 +1831,7 @@ typedef struct AggState
 	List	   *aggs;			/* all Aggref nodes in targetlist & quals */
 	int			numaggs;		/* length of list (could be zero!) */
 	int			numtrans;		/* number of pertrans items */
+	AggSplit	aggsplit;		/* agg-splitting mode, see nodes.h */
 	AggStatePerPhase phase;		/* pointer to current phase data */
 	int			numphases;		/* number of phases */
 	int			current_phase;	/* current phase number */
@@ -1831,12 +1840,9 @@ typedef struct AggState
 	AggStatePerTrans pertrans;	/* per-Trans state information */
 	ExprContext **aggcontexts;	/* econtexts for long-lived data (per GS) */
 	ExprContext *tmpcontext;	/* econtext for input expressions */
-	AggStatePerTrans curpertrans;	/* currently active trans state */
+	AggStatePerTrans curpertrans;		/* currently active trans state */
 	bool		input_done;		/* indicates end of input */
 	bool		agg_done;		/* indicates completion of Agg scan */
-	bool		combineStates;	/* input tuples contain transition states */
-	bool		finalizeAggs;	/* should we call the finalfn on agg states? */
-	bool		serialStates;	/* should agg states be (de)serialized? */
 	int			projected_set;	/* The last projected grouping set */
 	int			current_set;	/* The current grouping set being evaluated */
 	Bitmapset  *grouped_cols;	/* grouped cols in current projection */

@@ -362,8 +362,10 @@ advance_windowaggregate(WindowAggState *winstate,
 
 	/*
 	 * If pass-by-ref datatype, must copy the new value into aggcontext and
-	 * pfree the prior transValue.  But if transfn returned a pointer to its
-	 * first input, we don't need to do anything.
+	 * free the prior transValue.  But if transfn returned a pointer to its
+	 * first input, we don't need to do anything.  Also, if transfn returned a
+	 * pointer to a R/W expanded object that is already a child of the
+	 * aggcontext, assume we can adopt that value without copying it.
 	 */
 	if (!peraggstate->transtypeByVal &&
 		DatumGetPointer(newVal) != DatumGetPointer(peraggstate->transValue))
@@ -371,12 +373,25 @@ advance_windowaggregate(WindowAggState *winstate,
 		if (!fcinfo->isnull)
 		{
 			MemoryContextSwitchTo(peraggstate->aggcontext);
-			newVal = datumCopy(newVal,
-							   peraggstate->transtypeByVal,
-							   peraggstate->transtypeLen);
+			if (DatumIsReadWriteExpandedObject(newVal,
+											   false,
+											   peraggstate->transtypeLen) &&
+				MemoryContextGetParent(DatumGetEOHP(newVal)->eoh_context) == CurrentMemoryContext)
+				 /* do nothing */ ;
+			else
+				newVal = datumCopy(newVal,
+								   peraggstate->transtypeByVal,
+								   peraggstate->transtypeLen);
 		}
 		if (!peraggstate->transValueIsNull)
-			pfree(DatumGetPointer(peraggstate->transValue));
+		{
+			if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+											   false,
+											   peraggstate->transtypeLen))
+				DeleteExpandedObject(peraggstate->transValue);
+			else
+				pfree(DatumGetPointer(peraggstate->transValue));
+		}
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -513,8 +528,10 @@ advance_windowaggregate_base(WindowAggState *winstate,
 
 	/*
 	 * If pass-by-ref datatype, must copy the new value into aggcontext and
-	 * pfree the prior transValue.  But if invtransfn returned a pointer to
-	 * its first input, we don't need to do anything.
+	 * free the prior transValue.  But if invtransfn returned a pointer to its
+	 * first input, we don't need to do anything.  Also, if invtransfn
+	 * returned a pointer to a R/W expanded object that is already a child of
+	 * the aggcontext, assume we can adopt that value without copying it.
 	 *
 	 * Note: the checks for null values here will never fire, but it seems
 	 * best to have this stanza look just like advance_windowaggregate.
@@ -525,12 +542,25 @@ advance_windowaggregate_base(WindowAggState *winstate,
 		if (!fcinfo->isnull)
 		{
 			MemoryContextSwitchTo(peraggstate->aggcontext);
-			newVal = datumCopy(newVal,
-							   peraggstate->transtypeByVal,
-							   peraggstate->transtypeLen);
+			if (DatumIsReadWriteExpandedObject(newVal,
+											   false,
+											   peraggstate->transtypeLen) &&
+				MemoryContextGetParent(DatumGetEOHP(newVal)->eoh_context) == CurrentMemoryContext)
+				 /* do nothing */ ;
+			else
+				newVal = datumCopy(newVal,
+								   peraggstate->transtypeByVal,
+								   peraggstate->transtypeLen);
 		}
 		if (!peraggstate->transValueIsNull)
-			pfree(DatumGetPointer(peraggstate->transValue));
+		{
+			if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+											   false,
+											   peraggstate->transtypeLen))
+				DeleteExpandedObject(peraggstate->transValue);
+			else
+				pfree(DatumGetPointer(peraggstate->transValue));
+		}
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -568,7 +598,9 @@ finalize_windowaggregate(WindowAggState *winstate,
 								 numFinalArgs,
 								 perfuncstate->winCollation,
 								 (void *) winstate, NULL);
-		fcinfo.arg[0] = peraggstate->transValue;
+		fcinfo.arg[0] = MakeExpandedObjectReadOnly(peraggstate->transValue,
+											   peraggstate->transValueIsNull,
+												   peraggstate->transtypeLen);
 		fcinfo.argnull[0] = peraggstate->transValueIsNull;
 		anynull = peraggstate->transValueIsNull;
 
@@ -596,6 +628,7 @@ finalize_windowaggregate(WindowAggState *winstate,
 	}
 	else
 	{
+		/* Don't need MakeExpandedObjectReadOnly; datumCopy will copy it */
 		*result = peraggstate->transValue;
 		*isnull = peraggstate->transValueIsNull;
 	}
@@ -1801,10 +1834,8 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	/* Create long-lived context for storage of partition-local memory etc */
 	winstate->partcontext =
 		AllocSetContextCreate(CurrentMemoryContext,
-							  "WindowAgg_Partition",
-							  ALLOCSET_DEFAULT_MINSIZE,
-							  ALLOCSET_DEFAULT_INITSIZE,
-							  ALLOCSET_DEFAULT_MAXSIZE);
+							  "WindowAgg Partition",
+							  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Create mid-lived context for aggregate trans values etc.
@@ -1814,10 +1845,8 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	 */
 	winstate->aggcontext =
 		AllocSetContextCreate(CurrentMemoryContext,
-							  "WindowAgg_Aggregates",
-							  ALLOCSET_DEFAULT_MINSIZE,
-							  ALLOCSET_DEFAULT_INITSIZE,
-							  ALLOCSET_DEFAULT_MAXSIZE);
+							  "WindowAgg Aggregates",
+							  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * tuple table initialization
@@ -2220,9 +2249,9 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	/* build expression trees using actual argument & result types */
 	build_aggregate_transfn_expr(inputTypes,
 								 numArguments,
-								 0,	/* no ordered-set window functions yet */
-								 false,		/* no variadic window functions yet */
-								 wfunc->wintype,
+								 0,		/* no ordered-set window functions yet */
+								 false, /* no variadic window functions yet */
+								 aggtranstype,
 								 wfunc->inputcollid,
 								 transfn_oid,
 								 invtransfn_oid,
@@ -2321,10 +2350,8 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	if (OidIsValid(invtransfn_oid))
 		peraggstate->aggcontext =
 			AllocSetContextCreate(CurrentMemoryContext,
-								  "WindowAgg_AggregatePrivate",
-								  ALLOCSET_DEFAULT_MINSIZE,
-								  ALLOCSET_DEFAULT_INITSIZE,
-								  ALLOCSET_DEFAULT_MAXSIZE);
+								  "WindowAgg Per Aggregate",
+								  ALLOCSET_DEFAULT_SIZES);
 	else
 		peraggstate->aggcontext = winstate->aggcontext;
 
