@@ -2102,7 +2102,7 @@ static uint64 CopyFrom(CopyState cstate) {
 	/* Adam: check if the debugging mode works. */
 	elog(DEBUG1, "Begin the CopyFrom method.");
 	/* initialize the stats */
-	cstate->parse = 0;
+	cstate->parse = 0.0;
 
 
 	if (cstate->rel->rd_rel->relkind != RELKIND_RELATION) {
@@ -2409,6 +2409,7 @@ static uint64 CopyFrom(CopyState cstate) {
 	if (hi_options & HEAP_INSERT_SKIP_WAL)
 		heap_sync(cstate->rel);
 
+	elog(DEBUG1, "elapsed time for parsing: %f", cstate->parse);
 	return processed;
 }
 
@@ -2686,7 +2687,7 @@ CopyState BeginCopyFrom(ParseState *pstate, Relation rel, const char *filename,
 
 	MemoryContextSwitchTo(oldcontext);
 
-	elog(DEBUG1, "Parse time: %f", cstate->parse);
+	elog(DEBUG1, "Parse time: %f", cstate->parse/1000.0);
 
 	return cstate;
 }
@@ -2707,6 +2708,10 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 	read from the input file. */
 	bool done; /* Adam: no more data in the input file. */
 
+	/* Statistics about timing. */
+	struct timeval startLine, stopLine, startFields, stopFields;
+	double elapsedTimeLine, elapsedTimeFields;
+
 	/* only available for text or csv input */
 	Assert(!cstate->binary);
 
@@ -2723,8 +2728,13 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 
 	cstate->cur_lineno++;
 
+
 	/* Actually read the line into memory here */
+	gettimeofday(&startLine,NULL); // start time
 	done = CopyReadLine(cstate);
+	gettimeofday(&stopLine,NULL); // stop time
+	elapsedTimeLine = getElapsedTime(startLine, stopLine);
+	cstate->findLines += elapsedTimeLine;
 
 	/*
 	 * EOF at start of line means we're done.  If we see EOF after some
@@ -2738,10 +2748,14 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 	 *
 	 * Adam: besically, copy the line to another buffer and create an array with
 	 * the pointers to the begining of each field in the attribute buffer.  */
+	gettimeofday(&startFields,NULL); // start time
 	if (cstate->csv_mode)
 		fldct = CopyReadAttributesCSV(cstate);
 	else
 		fldct = CopyReadAttributesText(cstate);
+	gettimeofday(&stopFields,NULL); // start time
+	elapsedTimeFields = getElapsedTime(startFields, stopFields);
+	cstate->findFields += elapsedTimeFields;
 
 	*fields = cstate->raw_fields;
 	*nfields = fldct;
@@ -2823,12 +2837,13 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 			return false;
 		gettimeofday(&stop,NULL); // stop time
 		elapsedTime = getElapsedTime(start, stop);
+		//elog(DEBUG1, "elapsed time: %f", elapsedTime);
 		cstate->parse += elapsedTime;
 
 		/**
 		 * field_strings is the array of pointers to the attribute_buf
 		 * where the fields start.
-		**/
+		 */
 
 		/**
 		 * field_strings really contains: cstate->raw_fields
@@ -4291,7 +4306,7 @@ CreateCopyDestReceiver(void) {
 
 /** To measure the time of execution of some modules. */
 double getElapsedTime(struct timeval start, struct timeval stop) {
-    double elapsedTime = (stop.tv_sec - start.tv_sec) * 1000.0; // sec to ms
-    elapsedTime += (stop.tv_usec - start.tv_usec) / 1000.0; // us to ms
+    double elapsedTime = (stop.tv_sec - start.tv_sec) * 1000000.0; // sec to microsec
+    elapsedTime += (stop.tv_usec - start.tv_usec); // us (microsec)
     return elapsedTime;
 }
