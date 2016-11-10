@@ -52,6 +52,9 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
+#include "sys/time.h"
+#include "time.h"
+
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
 
@@ -209,10 +212,18 @@ typedef struct CopyStateData {
 	 * converts it.  Note: we guarantee that there is a \0 at
 	 * raw_buf[raw_buf_len].
 	 */
-#define RAW_BUF_SIZE 65536		/* we palloc RAW_BUF_SIZE+1 bytes */
+	#define RAW_BUF_SIZE 65536		/* we palloc RAW_BUF_SIZE+1 bytes */
 	char *raw_buf;
 	int raw_buf_index; /* next byte to process */
 	int raw_buf_len; /* total # of bytes stored */
+
+	/* Statistics about the timing. */
+	double findLines;
+	double findFields; /* tokenize */
+	double parse;
+	double deserialize;
+	double createTuples;
+
 } CopyStateData;
 
 /* DestReceiver for COPY (query) TO */
@@ -334,6 +345,8 @@ static void CopySendInt32(CopyState cstate, int32 val);
 static bool CopyGetInt32(CopyState cstate, int32 *val);
 static void CopySendInt16(CopyState cstate, int16 val);
 static bool CopyGetInt16(CopyState cstate, int16 *val);
+
+static double getElapsedTime(struct timeval start, struct timeval stop);
 
 /*
  * Send copy start/stop messages for frontend copies.  These have changed
@@ -2061,10 +2074,10 @@ limit_printout_length(const char *str) {
  * Copy FROM file to relation.
  */
 static uint64 CopyFrom(CopyState cstate) {
-	HeapTuple tuple;
+	HeapTuple tuple; /* Adam: a PostgreSQL tuple formed from the input line in a file. */
 	TupleDesc tupDesc;
-	Datum *values;
-	bool *nulls;
+	Datum *values; /* Adam: The binary values formed from the text fields. */
+	bool *nulls; /* Adam: The array that represents which attributes in a row are null. */
 	ResultRelInfo *resultRelInfo;
 	EState *estate = CreateExecutorState(); /* for ExecConstraints() */
 	ExprContext *econtext;
@@ -2079,12 +2092,18 @@ static uint64 CopyFrom(CopyState cstate) {
 	bool useHeapMultiInsert;
 	int nBufferedTuples = 0;
 
-#define MAX_BUFFERED_TUPLES 1000
+	#define MAX_BUFFERED_TUPLES 1000
 	HeapTuple *bufferedTuples = NULL; /* initialize to silence warning */
 	Size bufferedTuplesSize = 0;
 	int firstBufferedLineNo = 0;
 
 	Assert(cstate->rel);
+
+	/* Adam: check if the debugging mode works. */
+	elog(DEBUG1, "Begin the CopyFrom method.");
+	/* initialize the stats */
+	cstate->parse = 0;
+
 
 	if (cstate->rel->rd_rel->relkind != RELKIND_RELATION) {
 		if (cstate->rel->rd_rel->relkind == RELKIND_VIEW)
@@ -2254,6 +2273,11 @@ static uint64 CopyFrom(CopyState cstate) {
 		/* Switch into its memory context */
 		MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
+		/** In the next copy from we parse the input file (find the next lines
+		 * and extract fields within each line) and deserialize the input
+		 * (thus we go from the text format of the input to its binary
+		 * representation).
+		 */
 		if (!NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid))
 			break;
 
@@ -2662,6 +2686,8 @@ CopyState BeginCopyFrom(ParseState *pstate, Relation rel, const char *filename,
 
 	MemoryContextSwitchTo(oldcontext);
 
+	elog(DEBUG1, "Parse time: %f", cstate->parse);
+
 	return cstate;
 }
 
@@ -2725,7 +2751,7 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 /*
  * Read next tuple from file for COPY FROM. Return false if no more tuples.
  *
- * 'econtext' is used to evaluate default expression for each columns not
+ * 'econtext' is used to evaluate default expression for each column not
  * read from the file. It can be NULL when no default values are used, i.e.
  * when all columns are read from the file.
  *
@@ -2735,7 +2761,7 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
  *
  * Adam: process the attribute_buf and the raw_fields (basically the text of
  * extracted fields and the pointers to the fields in the attribute_buf,
- * and then extracted the values (*values) for the attributes and the pointer to the null
+ * and then extract the values (*values) for the attributes and the pointer to the null
  * values (nulls).
  */
 bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
@@ -2755,6 +2781,10 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 	bool file_has_oids = cstate->file_has_oids;
 	int *defmap = cstate->defmap;
 	ExprState **defexprs = cstate->defexprs;
+
+	/* Statistics about timing. */
+	struct timeval start, stop;
+	double elapsedTime;
 
 	tupDesc = RelationGetDescr(cstate->rel);
 	attr = tupDesc->attrs;
@@ -2782,9 +2812,18 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		/* text representation of a field/attribute. */
 		char *string;
 
-		/* read raw fields in the next line */
+		/* read raw fields in the next line
+		 *
+		 * Adam: this does parsing: finding first new lines and then extracting
+		 * raw fields.
+		 *
+		 * */
+		gettimeofday(&start,NULL); // start time
 		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
 			return false;
+		gettimeofday(&stop,NULL); // stop time
+		elapsedTime = getElapsedTime(start, stop);
+		cstate->parse += elapsedTime;
 
 		/**
 		 * field_strings is the array of pointers to the attribute_buf
@@ -2817,7 +2856,9 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT), errmsg("null OID in COPY data")));
 			else if (cstate->oids && tupleOid != NULL) {
 				cstate->cur_attname = "oid";
-				/* The string (from attribute_buf are separated by the null character, so this is okay to be displayed from the pointer. */
+				/* Adam: The string (from attribute_buf are separated by the
+				 * null character, so this is okay to be displayed from the
+				 * pointer. */
 				cstate->cur_attval = string;
 				*tupleOid = DatumGetObjectId(
 						DirectFunctionCall1(oidin, CStringGetDatum(string)));
@@ -2829,7 +2870,15 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 			}
 		}
 
-		/* Loop to read the user attributes on the line. */
+		/* Loop to read the user attributes on the line.
+		 *
+		 *
+		 * Adam: in this foreach loop we deserialize the extracted text fields.
+		 *
+		 * We identified fields (in text format) in the input line and now
+		 * we have to convert the fields to the binary representation - this is
+		 * the deserialization.
+		 * */
 		foreach(cur, cstate->attnumlist)
 		{
 			int attnum = lfirst_int(cur);
@@ -2840,6 +2889,10 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT), errmsg("missing data for column \"%s\"", NameStr(attr[m]->attname))));
 			string = field_strings[fieldno++];
 
+			/** Adam: This part of the code in PostgreSQL is undocumented and
+			 * not accessible from the SQL interface - users cannot spcify
+			 * which columns from the input raw file should be loaded.
+			 */
 			if (cstate->convert_select_flags
 					&& !cstate->convert_select_flags[m]) {
 				/* ignore input field, leaving column as NULL */
@@ -2867,6 +2920,26 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 
 			cstate->cur_attname = NameStr(attr[m]->attname);
 			cstate->cur_attval = string;
+			/** Adam: change the raw string value from the input file to the
+			 * valid internal Datum field.
+			 *
+			 * This is deserialization - from the raw fields to the real data
+			 * types, mostly, it calss functions from adt/int.c, for example:
+			 *
+			 *
+			 *		int2in			- converts "num" to short
+			 *
+				Datum
+				int2in(PG_FUNCTION_ARGS)
+				{
+					char	   *num = PG_GETARG_CSTRING(0);
+
+					PG_RETURN_INT16(pg_atoi(num, sizeof(int16), '\0'));
+				}
+			 *
+			 * The int2in function is hidden behind the function pointer in
+			 * in_functions.
+			 */
 			values[m] = InputFunctionCall(&in_functions[m], string,
 					typioparams[m], attr[m]->atttypmod);
 			if (string != NULL)
@@ -2941,7 +3014,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 					typioparams[m], attr[m]->atttypmod, &nulls[m]);
 			cstate->cur_attname = NULL;
 		}
-	}+
+	}
 	/*
 	 * Now compute and insert any defaults available for the columns not
 	 * provided by the input data.  Anything not processed here or above will
@@ -4214,4 +4287,11 @@ CreateCopyDestReceiver(void) {
 	self->processed = 0;
 
 	return (DestReceiver *) self;
+}
+
+/** To measure the time of execution of some modules. */
+double getElapsedTime(struct timeval start, struct timeval stop) {
+    double elapsedTime = (stop.tv_sec - start.tv_sec) * 1000.0; // sec to ms
+    elapsedTime += (stop.tv_usec - start.tv_usec) / 1000.0; // us to ms
+    return elapsedTime;
 }
