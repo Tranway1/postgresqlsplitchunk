@@ -51,9 +51,10 @@
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
-
 #include "sys/time.h"
-#include "time.h"
+
+/* Specify if you want to measure the time for different stages of data loading. */
+#define DEBUG_TIME true
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
@@ -345,8 +346,28 @@ static void CopySendInt32(CopyState cstate, int32 val);
 static bool CopyGetInt32(CopyState cstate, int32 *val);
 static void CopySendInt16(CopyState cstate, int16 val);
 static bool CopyGetInt16(CopyState cstate, int16 *val);
+inline static double getElapsedTime(struct timeval start, struct timeval stop);
+inline static int getTime(struct timeval * tp, struct timezone * tzp);
 
-static double getElapsedTime(struct timeval start, struct timeval stop);
+#ifdef DEBUG_TIME
+int getTime(struct timeval * tp, struct timezone * tzp) {
+	return gettimeofday(tp, tzp);
+}
+/** To measure the time of execution of some modules. */
+double getElapsedTime(struct timeval start, struct timeval stop) {
+    double elapsedTime = (stop.tv_sec - start.tv_sec) * 1000000.0; // sec to microsec
+    elapsedTime += (stop.tv_usec - start.tv_usec); // us (microsec)
+    return elapsedTime/1000.0;
+}
+#else
+// stubs: this does nothing when no debug enabled
+int getTime(struct timeval * tp, struct timezone * tzp) {
+	return 0;
+}
+double getElapsedTime(struct timeval start, struct timeval stop) {
+    return 0.0;
+}
+#endif
 
 /*
  * Send copy start/stop messages for frontend copies.  These have changed
@@ -2097,13 +2118,26 @@ static uint64 CopyFrom(CopyState cstate) {
 	Size bufferedTuplesSize = 0;
 	int firstBufferedLineNo = 0;
 
+	/* Measure the total copy time. */
+	struct timeval startCopy, stopCopy;
+
+	/* Statistics about timing for tuple creation. */
+	struct timeval start, stop;
+
 	Assert(cstate->rel);
 
 	/* Adam: check if the debugging mode works. */
 	elog(DEBUG1, "Begin the CopyFrom method.");
+	getTime(&startCopy,NULL);
 	/* initialize the stats */
 	cstate->parse = 0.0;
+	cstate->findFields = 0.0;
+	cstate->findLines = 0.0;
+	cstate->createTuples = 0.0;
+	cstate->deserialize = 0.0;
 
+	/* start measuring time for tuple creation */
+	getTime(&start,NULL); // start time
 
 	if (cstate->rel->rd_rel->relkind != RELKIND_RELATION) {
 		if (cstate->rel->rd_rel->relkind == RELKIND_VIEW)
@@ -2254,10 +2288,16 @@ static uint64 CopyFrom(CopyState cstate) {
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	getTime(&stop,NULL); // stop time
+	cstate->createTuples += getElapsedTime(start, stop);
+
 	for (;;) {
 		TupleTableSlot *slot;
 		bool skip_tuple;
 		Oid loaded_oid = InvalidOid;
+
+		/* next stop - measure time for tuple creation */
+		getTime(&start,NULL); // start time
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -2273,6 +2313,11 @@ static uint64 CopyFrom(CopyState cstate) {
 		/* Switch into its memory context */
 		MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
+
+		/* Exclude the parsing from time for tuple creation. */
+		getTime(&stop,NULL); // stop time
+		cstate->createTuples += getElapsedTime(start, stop);;
+
 		/** In the next copy from we parse the input file (find the next lines
 		 * and extract fields within each line) and deserialize the input
 		 * (thus we go from the text format of the input to its binary
@@ -2280,6 +2325,9 @@ static uint64 CopyFrom(CopyState cstate) {
 		 */
 		if (!NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid))
 			break;
+
+		/* Next step - start measuring time for tuple creation. */
+		getTime(&start,NULL); // start time
 
 		/* And now we can form the input tuple. */
 		tuple = heap_form_tuple(tupDesc, values, nulls);
@@ -2365,7 +2413,11 @@ static uint64 CopyFrom(CopyState cstate) {
 			 */
 			processed++;
 		}
+		getTime(&stop,NULL); // stop time
+		cstate->createTuples += getElapsedTime(start, stop);;
 	}
+	/* Next step - start measuring time for tuple creation. */
+	getTime(&start,NULL); // start time
 
 	/* Flush any remaining buffered tuples */
 	if (nBufferedTuples > 0)
@@ -2409,7 +2461,19 @@ static uint64 CopyFrom(CopyState cstate) {
 	if (hi_options & HEAP_INSERT_SKIP_WAL)
 		heap_sync(cstate->rel);
 
+	getTime(&stop,NULL); // stop time
+	cstate->createTuples += getElapsedTime(start, stop);
+
 	elog(DEBUG1, "elapsed time for parsing: %f", cstate->parse);
+	elog(DEBUG1, "elapsed time for lines: %f", cstate->findLines);
+	elog(DEBUG1, "elapsed time for fields: %f", cstate->findFields);
+	elog(DEBUG1, "elapsed time for deserialization: %f", cstate->deserialize);
+	elog(DEBUG1, "elapsed time for tuple creation: %f", cstate->createTuples);
+
+	/* Adam: check if the debugging mode works. */
+	elog(DEBUG1, "The end the CopyFrom method.");
+	getTime(&stopCopy,NULL);
+	elog(DEBUG1, "Total time for the copy command: %f", getElapsedTime(startCopy, stopCopy));
 	return processed;
 }
 
@@ -2687,7 +2751,7 @@ CopyState BeginCopyFrom(ParseState *pstate, Relation rel, const char *filename,
 
 	MemoryContextSwitchTo(oldcontext);
 
-	elog(DEBUG1, "Parse time: %f", cstate->parse/1000.0);
+	//elog(DEBUG1, "Parse time: %f", cstate->parse/1000.0);
 
 	return cstate;
 }
@@ -2710,7 +2774,6 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 
 	/* Statistics about timing. */
 	struct timeval startLine, stopLine, startFields, stopFields;
-	double elapsedTimeLine, elapsedTimeFields;
 
 	/* only available for text or csv input */
 	Assert(!cstate->binary);
@@ -2728,13 +2791,11 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 
 	cstate->cur_lineno++;
 
-
 	/* Actually read the line into memory here */
-	gettimeofday(&startLine,NULL); // start time
+	getTime(&startLine,NULL); // start time for line parsing - find a line
 	done = CopyReadLine(cstate);
-	gettimeofday(&stopLine,NULL); // stop time
-	elapsedTimeLine = getElapsedTime(startLine, stopLine);
-	cstate->findLines += elapsedTimeLine;
+	getTime(&stopLine,NULL); // stop time for line parsing - find a line
+	cstate->findLines += getElapsedTime(startLine, stopLine);
 
 	/*
 	 * EOF at start of line means we're done.  If we see EOF after some
@@ -2746,16 +2807,15 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 
 	/* Parse the line into de-escaped field values.
 	 *
-	 * Adam: besically, copy the line to another buffer and create an array with
+	 * Adam: copy the line to another buffer and create an array with
 	 * the pointers to the begining of each field in the attribute buffer.  */
-	gettimeofday(&startFields,NULL); // start time
+	getTime(&startFields,NULL); // start time - find fields in the line
 	if (cstate->csv_mode)
 		fldct = CopyReadAttributesCSV(cstate);
 	else
 		fldct = CopyReadAttributesText(cstate);
-	gettimeofday(&stopFields,NULL); // start time
-	elapsedTimeFields = getElapsedTime(startFields, stopFields);
-	cstate->findFields += elapsedTimeFields;
+	getTime(&stopFields,NULL); // stop time for finding fields in the line
+	cstate->findFields += getElapsedTime(startFields, stopFields);
 
 	*fields = cstate->raw_fields;
 	*nfields = fldct;
@@ -2797,8 +2857,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 	ExprState **defexprs = cstate->defexprs;
 
 	/* Statistics about timing. */
-	struct timeval start, stop;
-	double elapsedTime;
+	struct timeval startParsing, stopParsing, startDeserialize, stopDeserialize;
 
 	tupDesc = RelationGetDescr(cstate->rel);
 	attr = tupDesc->attrs;
@@ -2813,7 +2872,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 	/* Adam: nulls denotes which attributes in the record/tuple are nulls. */
 	MemSet(nulls, true, num_phys_attrs * sizeof(bool));
 
-	/* Adam: procss the row for text/CSV formats. */
+	/* Adam: process the row for text/CSV formats. */
 	if (!cstate->binary) {
 		/* It stores the pointers to the fields (in string format) in the
 		 * attribute_buf. */
@@ -2832,13 +2891,12 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		 * raw fields.
 		 *
 		 * */
-		gettimeofday(&start,NULL); // start time
+		getTime(&startParsing,NULL); // start time
 		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
 			return false;
-		gettimeofday(&stop,NULL); // stop time
-		elapsedTime = getElapsedTime(start, stop);
+		getTime(&stopParsing,NULL); // stop time
 		//elog(DEBUG1, "elapsed time: %f", elapsedTime);
-		cstate->parse += elapsedTime;
+		cstate->parse += getElapsedTime(startParsing, stopParsing);
 
 		/**
 		 * field_strings is the array of pointers to the attribute_buf
@@ -2849,6 +2907,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		 * field_strings really contains: cstate->raw_fields
 		 */
 
+		getTime(&startDeserialize,NULL); // start time
 		/* check for overflowing fields */
 		if (nfields > 0 && fldct > nfields)
 			ereport(ERROR,
@@ -2964,6 +3023,10 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		}
 
 		Assert(fieldno == nfields);
+
+		getTime(&stopDeserialize,NULL); // stop time
+		//elog(DEBUG1, "elapsed time: %f", elapsedTime);
+		cstate->deserialize += getElapsedTime(startDeserialize, stopDeserialize);
 	} else {
 		/* binary */
 		int16 fld_count;
@@ -3030,6 +3093,8 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 			cstate->cur_attname = NULL;
 		}
 	}
+
+	getTime(&startDeserialize,NULL); // start time
 	/*
 	 * Now compute and insert any defaults available for the columns not
 	 * provided by the input data.  Anything not processed here or above will
@@ -3046,6 +3111,8 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
 				&nulls[defmap[i]], NULL);
 	}
+	getTime(&stopDeserialize,NULL); // stop time
+	cstate->deserialize += getElapsedTime(startDeserialize, stopDeserialize);
 
 	return true;
 }
@@ -4304,9 +4371,4 @@ CreateCopyDestReceiver(void) {
 	return (DestReceiver *) self;
 }
 
-/** To measure the time of execution of some modules. */
-double getElapsedTime(struct timeval start, struct timeval stop) {
-    double elapsedTime = (stop.tv_sec - start.tv_sec) * 1000000.0; // sec to microsec
-    elapsedTime += (stop.tv_usec - start.tv_usec); // us (microsec)
-    return elapsedTime;
-}
+
