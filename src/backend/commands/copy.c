@@ -218,12 +218,12 @@ typedef struct CopyStateData {
 	int raw_buf_index; /* next byte to process */
 	int raw_buf_len; /* total # of bytes stored */
 
-	/* Statistics about the timing. */
-	double findLines;
-	double findFields; /* tokenize */
-	double parse;
-	double deserialize;
-	double createTuples;
+	/* Statistics about the data loading time. */
+	double findLines; /* find new lines delimiters */
+	double findFields; /* tokenize - find attributes in a line */
+	double parse; /* both - find new lines and field delimiters (= findLines + findFields) */
+	double deserialize; /* change from string to binary representation */
+	double createTuples; /* create database specific format for newly loaded data */
 
 } CopyStateData;
 
@@ -3224,13 +3224,15 @@ static bool CopyReadLine(CopyState cstate) {
 /*
  * CopyReadLineText - inner loop of CopyReadLine for text mode or csv mode.
  *
- * This function only finds lines and does not process the lines
- * (specifically, it does not fine the fields).
+ * Adam: This function only finds lines and does not process the lines
+ * (specifically, it does not fine the fields). It only finds new line delimiters.
+ *
+ * Adam: this is the function to find a new line and copy it to the line buffer.
  */
 static bool CopyReadLineText(CopyState cstate) {
-	char *copy_raw_buf;
-	int raw_buf_ptr;
-	int copy_buf_len;
+	char *copy_raw_buf; /* Adam:  raw_buf holds raw data read from the data source (file or client connection). */
+	int raw_buf_ptr; /* Adam:  next byte to be processed from the raw buffer. */
+	int copy_buf_len; /* Adam: we guarantee that there is a \0 at raw_buf[raw_buf_len]. */
 	bool need_data = false;
 	bool hit_eof = false;
 	bool result = false;
@@ -3277,12 +3279,15 @@ static bool CopyReadLineText(CopyState cstate) {
 	raw_buf_ptr = cstate->raw_buf_index;
 	copy_buf_len = cstate->raw_buf_len;
 
+	/* Adam: in the original version it reads characters one by one. */
 	for (;;) {
-		int prev_raw_ptr;
-		char c;
+		int prev_raw_ptr; /* store the previous position of the raw_buf_ptr */
+		char c; /* the new character fetched from the copy_raw_buf buffer */
 
 		/*
-		 * Load more data if needed.  Ideally we would just force four bytes
+		 * Load more data if needed.
+		 *
+		 * Ideally we would just force four bytes
 		 * of read-ahead and avoid the many calls to
 		 * IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(), but the COPY_OLD_FE protocol
 		 * does not allow us to read too far ahead or we might read into the
@@ -3292,11 +3297,14 @@ static bool CopyReadLineText(CopyState cstate) {
 		 * considering the size of the buffer.
 		 */
 		if (raw_buf_ptr >= copy_buf_len || need_data) {
+			/* Copy characters from the raw_buf to the line_buf. */
 			REFILL_LINEBUF;
 
 			/*
-			 * Try to read some more data.  This will certainly reset
-			 * raw_buf_index to zero, and raw_buf_ptr must go with it.
+			 * Try to read some more raw data
+			 * (from the source file/connection/pipe).
+			 * This will certainly reset raw_buf_index to zero,
+			 * and raw_buf_ptr must go with it.
 			 */
 			if (!CopyLoadRawBuf(cstate))
 				hit_eof = true;
@@ -3312,10 +3320,10 @@ static bool CopyReadLineText(CopyState cstate) {
 				break;
 			}
 			need_data = false;
-		}
+		} /* Adam: the raw_buf was refilled. */
 
 		/* OK to fetch a character */
-		prev_raw_ptr = raw_buf_ptr; /* Adam: store the pointer to the current position in the raw buffer. */
+		prev_raw_ptr = raw_buf_ptr; /* Adam: store the pointer to the current position in the raw buffer (from which we would fetch the next character. */
 		c = copy_raw_buf[raw_buf_ptr++]; /* just fetch next character from the raw buffer and move the pointer to the raw buffer one character ahead */
 
 		/* Adam: the copy command can operate only in the text, csv or binary mode in the original version of the copy command. */
