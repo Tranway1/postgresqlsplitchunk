@@ -52,9 +52,26 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "sys/time.h"
+#include "assert.h"
 
 /* Specify if you want to measure the time for different stages of data loading. */
 #define DEBUG_TIME true
+
+/* Specify if you want to use the SIMD instructions. */
+#define USE_SSE
+
+#ifdef USE_SSE
+
+//#include <smmintrin.h> - this is included in the immintrin.h
+
+/* for SIMD instructions */
+#include <immintrin.h>
+/* how many characters can be stored in SIMD registers */
+#define N_CHAR_SIMD 16
+
+#define MIN(a,b) ((a) < (b) ? a : b)
+
+#endif // USE_SSE
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
@@ -249,6 +266,9 @@ typedef struct {
 /*
  * This keeps the character read at the top of the loop in the buffer
  * even if there is more than one read-ahead.
+ *
+ * Adam: It undoes the fetch to the place from the beginning of the main for loop in
+ * which we are processing all the characters from the raw_buf to the line_buf.
  */
 #define IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(extralen) \
 if (1) \
@@ -321,6 +341,11 @@ static void CopyFromInsertBatch(CopyState cstate, EState *estate,
 		HeapTuple *bufferedTuples, int firstBufferedLineNo);
 /* Adam: it only identifies the line boundaries. */
 static bool CopyReadLine(CopyState cstate);
+
+#ifdef USE_SSE
+	static int findFirstDelimiter(const char *src, int src_len, __m128i delimiters, int delimiters_len);
+#endif // USE_SSE
+
 static bool CopyReadLineText(CopyState cstate);
 static int CopyReadAttributesText(CopyState cstate);
 static int CopyReadAttributesCSV(CopyState cstate);
@@ -3221,6 +3246,67 @@ static bool CopyReadLine(CopyState cstate) {
 	return result;
 }
 
+#ifdef USE_SSE
+/**
+   Find one of the delimiters in the input text and return the index where
+   the delimiter was found.
+
+   return:
+   n - index in the src of the found delimiter (n >= 0) or the place from which the processing should be started (if non-ASCII character was found)
+   -1 denotes no delimiter found
+*/
+int findFirstDelimiter(const char *src, const int src_len, const __m128i delimiters, const int delimiters_len) {
+    int index; // the index of the first found delimiter in src
+    __m128i data; // chunk of src sent to a SIMD register
+    int current_data_len; // current data length to be sent to SIMD registers
+    int n; // the index for the for loop - this is also a pointer to the current batch or number of characters that were processed in N_CHAR_SIMD batches up to now
+    /* the mask which contains 16 bits - a bit is set if a char for a given bit is non-ASCII - the high bit is set */
+    unsigned int mask_epi8;
+    /* n - is the current position in the src */
+    for (n=0; n < src_len; n+=N_CHAR_SIMD) {
+		//printf("n: %d\n", n);
+		/*
+		  If we are at the end of the src processing then
+		  the (current) data len will be smaller than N_CHAR_SIMD.
+		  Otherwise, the (current) data length should be N_CHAR_SIMD.
+		 */
+		int remaining_chars = src_len-n; // remaining chars to be checked
+		current_data_len = MIN(remaining_chars,N_CHAR_SIMD);
+		//printf("current_data_len: %d\n", current_data_len);
+		if (current_data_len == N_CHAR_SIMD) {
+			data = _mm_loadu_si128((__m128i*)(src+n));
+		} else { // the for loop checks if there is zero characters left, so if we are here, then there has to be at least one character more
+			// just copy the data to local buffer to ensure there are enough bytes to copy to SIMD registers
+			char remaining_data[N_CHAR_SIMD] = {};
+			strncpy(remaining_data, src+n, current_data_len);
+			data = _mm_loadu_si128((__m128i*)remaining_data);
+		}
+		/*
+		   int _mm_cmpestri (__m128i a, int la, __m128i b, int lb, const int imm8)
+		   Compare packed strings in a and b with lengths la and lb using the control in imm8, and store the generated index in dst.
+		   find characters from a set
+		 */
+		// mode: unsigned 8-bit characters
+		// mode: compare equal any
+		/* check if these are ASCII characters */
+		mask_epi8 =_mm_movemask_epi8(data);
+		if (mask_epi8 != 0) {
+			/* Found non-ASCII characters (more than 1 byte characters).
+			 *
+			 * Return the current batch pointer.
+			 *
+			 * We could have already processed some batches without nonASCII characters.*/
+			return n;
+		}
+		index = _mm_cmpestri(delimiters, delimiters_len, data, current_data_len, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY);
+		if (index < N_CHAR_SIMD) {
+			return n+index;
+		}
+    }
+    return -1; // no delimiters found and the src char buffer does not contain non-ASCII characters
+}
+#endif // USE_SSE
+
 /*
  * CopyReadLineText - inner loop of CopyReadLine for text mode or csv mode.
  *
@@ -3243,6 +3329,13 @@ static bool CopyReadLineText(CopyState cstate) {
 	bool in_quote = false, last_was_esc = false;
 	char quotec = '\0';
 	char escapec = '\0';
+
+	#ifdef USE_SSE
+		int new_index; /* new index for a found delimiter - by SIMD instruction */
+		__m128i delimiters; /* the delimiters that we are searching for in the SIMD format */
+		char raw_delimiters[N_CHAR_SIMD] = {}; /* the delimiters that we search for (the raw format) */
+		int delimiters_len = 0; /* the number of delimiters - initially set to 0 */
+	#endif
 
 	if (cstate->csv_mode) {
 		quotec = cstate->quote[0];
@@ -3278,6 +3371,24 @@ static bool CopyReadLineText(CopyState cstate) {
 	copy_raw_buf = cstate->raw_buf;
 	raw_buf_ptr = cstate->raw_buf_index;
 	copy_buf_len = cstate->raw_buf_len;
+
+	#ifdef USE_SSE
+		raw_delimiters[delimiters_len++] = '\n';
+		if (quotec != '\0') {
+			raw_delimiters[delimiters_len++] = quotec;
+		}
+		raw_delimiters[delimiters_len++] = '\r';
+		raw_delimiters[delimiters_len++] = '\\';
+		if (escapec != '\0') {
+			raw_delimiters[delimiters_len++] = escapec;
+		}
+		//elog(DEBUG1, "delimiters length: %d", delimiters_len);
+		//elog(DEBUG1, "delimiters: %s", raw_delimiters);
+		/* The number of delimiters that we can check in one go has to be lower
+		 * than the SIMD register width. */
+		/* Load the delimiters to SIMD register. */
+		delimiters = _mm_loadu_si128((__m128i*)raw_delimiters);
+	#endif
 
 	/* Adam: in the original version it reads characters one by one. */
 	for (;;) {
@@ -3323,9 +3434,37 @@ static bool CopyReadLineText(CopyState cstate) {
 		} /* Adam: the raw_buf was refilled. */
 
 		/* OK to fetch a character */
-		prev_raw_ptr = raw_buf_ptr; /* Adam: store the pointer to the current position in the raw buffer (from which we would fetch the next character. */
-		c = copy_raw_buf[raw_buf_ptr++]; /* just fetch next character from the raw buffer and move the pointer to the raw buffer one character ahead */
 
+		#ifdef USE_SSE
+			//elog(DEBUG1, "USE SIMD");
+			/* Find the index where a delimiter is. */
+			new_index = findFirstDelimiter(copy_raw_buf + raw_buf_ptr, copy_buf_len-raw_buf_ptr, delimiters, delimiters_len);
+			if (new_index >= 0) {
+				/* set the new buffer pointer to the found delimiter */
+				raw_buf_ptr = raw_buf_ptr + new_index;
+				//elog(DEBUG1, "new index SIMD: %d", new_index);
+				//elog(DEBUG1, "raw_buf_ptr: %d", raw_buf_ptr);
+				//elog(DEBUG1, "copy_buf_len: %d", copy_buf_len);
+			} else {
+				//elog(DEBUG1, "new index SIMD: %d", new_index);
+				/* new_index == -1 - didn't find any delimiter or non-ASCII character in the whole buffer */
+				raw_buf_ptr = copy_buf_len;
+				/* we processed the whole buffer, so need more data */
+				need_data = true;
+				continue;
+			}
+			/* if this is the first check for the new line in the buffer and
+			 * we skipped a few first characters, then indicate it's not
+			 * the first character in line */
+			if (first_char_in_line && new_index > 0) {
+				first_char_in_line = false;
+			}
+		#endif
+			/* set the previous raw ptr to the current raw buffer and move
+			 * the raw buf ptr one character beyond last found delimiter */
+			prev_raw_ptr = raw_buf_ptr; /* Adam: store the pointer to the current position in the raw buffer (from which we would fetch the next character. */
+			c = copy_raw_buf[raw_buf_ptr++]; /* just fetch next character from the raw buffer and move the pointer to the raw buffer one character ahead */
+			//elog(DEBUG1, "next character in CopyReadLineText: %c", c);
 		/* Adam: the copy command can operate only in the text, csv or binary mode in the original version of the copy command. */
 		if (cstate->csv_mode) {
 			/*
@@ -3461,7 +3600,9 @@ static bool CopyReadLineText(CopyState cstate) {
 					}
 				}
 
-				/* Get the next character */
+				/* we need to Get the next character so if there are no more
+				 * characters in the raw_buf then refill it and come back
+				 * to this place by setting the raw_buf_ptr to prev_raw_ptr */
 				IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(0);
 				/* if hit_eof, c2 will become '\0' */
 				c2 = copy_raw_buf[raw_buf_ptr++];
@@ -3875,7 +4016,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		 * the output_ptr points to the beginning of the attribute data buffer
 		 * at the start and later on to the beginning of each field.
 		 *
-		 * Adam: in the raw_fields store the pointers to the beggining of
+		 * Adam: in the raw_fields store the pointers to the beginning of
 		 * attributes stored in the attribute_buf. */
 		cstate->raw_fields[fieldno] = output_ptr;
 
@@ -3898,13 +4039,14 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				 * line from cstate->line_buf.data, but at the same time if the
 				 * line finished then you also finished processing of this very
 				 * field. */
-				if (cur_ptr >= line_end_ptr)
+				if (cur_ptr >= line_end_ptr) {
 					/* Adam: indeed, we do not set found_delim = true; which means
 					 * that we did not found the field delimiter so had to finish
 					 * processing when the line end was encountered, so finish
 					 * this metod for line processing to find fields.
 					 */
 					goto endfield;
+				}
 				/* Adam: get a/(the next) character from the line buffer.
 				 *
 				 * This is also where we iterate through the
