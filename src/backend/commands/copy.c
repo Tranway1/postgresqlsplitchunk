@@ -62,14 +62,14 @@
 
 #ifdef USE_SSE
 
-//#include <smmintrin.h> - this is included in the immintrin.h
+	//#include <smmintrin.h> - this is included in the immintrin.h
 
-/* for SIMD instructions */
-#include <immintrin.h>
-/* how many characters can be stored in SIMD registers */
-#define N_CHAR_SIMD 16
+	/* for SIMD instructions */
+	#include <immintrin.h>
+	/* how many characters can be stored in SIMD registers */
+	#define N_CHAR_SIMD 16
 
-#define MIN(a,b) ((a) < (b) ? a : b)
+	#define MIN(a,b) ((a) < (b) ? a : b)
 
 #endif // USE_SSE
 
@@ -2912,8 +2912,9 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 
 		/* read raw fields in the next line
 		 *
-		 * Adam: this does parsing: finding first new lines and then extracting
-		 * raw fields.
+		 * Adam: this does parsing: finding (1) first new lines and then
+		 * (2) extracting raw fields (finding field delimiters).
+		 * Yes, there are two phases of the parsing process.
 		 *
 		 * */
 		getTime(&startParsing,NULL); // start time
@@ -2972,7 +2973,9 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		/* Loop to read the user attributes on the line.
 		 *
 		 *
-		 * Adam: in this foreach loop we deserialize the extracted text fields.
+		 * Adam: in this foreach loop we deserialize
+		 * (convert from text to binary format)
+		 * the extracted text fields.
 		 *
 		 * We identified fields (in text format) in the input line and now
 		 * we have to convert the fields to the binary representation - this is
@@ -2989,7 +2992,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 			string = field_strings[fieldno++];
 
 			/** Adam: This part of the code in PostgreSQL is undocumented and
-			 * not accessible from the SQL interface - users cannot spcify
+			 * not accessible from the SQL interface - users cannot specify
 			 * which columns from the input raw file should be loaded.
 			 */
 			if (cstate->convert_select_flags
@@ -3023,7 +3026,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 			 * valid internal Datum field.
 			 *
 			 * This is deserialization - from the raw fields to the real data
-			 * types, mostly, it calss functions from adt/int.c, for example:
+			 * types, mostly, it calls functions from adt/int.c, for example:
 			 *
 			 *
 			 *		int2in			- converts "num" to short

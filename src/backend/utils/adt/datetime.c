@@ -31,6 +31,22 @@
 #include "utils/memutils.h"
 #include "utils/tzparser.h"
 
+/* Specify if you want to use the SIMD instructions. */
+#define USE_SSE
+
+#ifdef USE_SSE
+
+	/* #include <smmintrin.h> //- this is included in the immintrin.h */
+
+	/* for SIMD instructions */
+	#include <immintrin.h>
+	/* how many characters can be stored in SIMD registers */
+	#define N_CHAR_SIMD 16
+
+	#define MIN(a,b) ((a) < (b) ? a : b)
+
+#endif // USE_SSE
+
 
 static int DecodeNumber(int flen, char *field, bool haveTextMonth,
 			 int fmask, int *tmask,
@@ -41,6 +57,11 @@ static int DecodeNumberField(int len, char *str,
 static int DecodeTime(char *str, int fmask, int range,
 		   int *tmask, struct pg_tm * tm, fsec_t *fsec);
 static const datetkn *datebsearch(const char *key, const datetkn *base, int nel);
+
+#ifdef USE_SSE
+	inline static void notInRangeToReplace(char *src, int src_len, __m128i replace, __m128i range, int range_len);
+#endif // USE_SSE
+
 static int DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 		   struct pg_tm * tm);
 
@@ -2434,6 +2455,49 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 	return 0;
 }
 
+#ifdef USE_SSE
+
+/**
+   Change the bytes in src that are not in range to the characters set in replace.
+   The src is changed in place.
+ */
+void notInRangeToReplace(char *src, int src_len, __m128i replace, __m128i range, int range_len) {
+    int current_data_len; /* The length of the src data. */
+    __m128i data; /* The chunk of src loaded to SIMD registers. */
+    __m128i result_simd; /* The 16 byte mask - with not bytes in range set to 1. */
+    char *address; /* The current address in src for processing. */
+    int n; /* To which byte in src we reached. */
+
+    /* n - is the current position in the src */
+    for (n=0; n < src_len; n+=N_CHAR_SIMD) {
+		//printf("n: %d\n", n);
+		/*
+		  If we are at the end of the src processing then
+		  the (current) data len will be smaller than N_CHAR_SIMD.
+		  Otherwise, the (current) data length should be N_CHAR_SIMD.
+		*/
+		int remaining_chars = src_len-n; // remaining chars to be checked
+		current_data_len = MIN(remaining_chars,N_CHAR_SIMD);
+		//printf("current_data_len: %d\n", current_data_len);
+		address=src+n; /* address of currently processed chunk of src */
+		if (current_data_len == N_CHAR_SIMD) {
+			data = _mm_loadu_si128((__m128i*)(address));
+			result_simd = _mm_cmpestrm(range, range_len, data, N_CHAR_SIMD, _SIDD_UBYTE_OPS | _SIDD_CMP_RANGES | _SIDD_MASKED_NEGATIVE_POLARITY |  _SIDD_UNIT_MASK);
+			_mm_maskmoveu_si128(replace, result_simd, address);
+		} else { // the for loop checks if there is zero characters left, so if we are here then there has to be at least one character more
+			// just copy the data to local buffer to ensure there are enough bytes to copy to SIMD register
+			char remaining_data[N_CHAR_SIMD] = {};
+			memcpy(remaining_data, address, current_data_len);
+			data = _mm_loadu_si128((__m128i*)remaining_data);
+			result_simd = _mm_cmpestrm(range, range_len, data, N_CHAR_SIMD, _SIDD_UBYTE_OPS | _SIDD_CMP_RANGES | _SIDD_MASKED_NEGATIVE_POLARITY |  _SIDD_UNIT_MASK);
+			_mm_maskmoveu_si128 (replace, result_simd, remaining_data);
+			memcpy(address, remaining_data, current_data_len);
+		}
+    }
+}
+
+#endif // USE_SSE
+
 /* DecodeDate()
  * Decode date string which includes delimiters.
  * Return 0 if okay, a DTERR code if not.
@@ -2449,22 +2513,73 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 		   struct pg_tm * tm)
 {
 	fsec_t		fsec;
-	int			nf = 0;
-	int			i,
+	int			nf = 0; /* number of subfields (parts) in this field */
+	int			i, /* the counter for the for loop */
 				len;
 	int			dterr;
 	bool		haveTextMonth = FALSE;
 	int			type,
 				val,
 				dmask = 0;
+	/* field[] - pointers to field strings are stored in this array */
 	char	   *field[MAXDATEFIELDS];
 
-	*tmask = 0;
+	/* parse this string...
+	 *
+	 * Adam: the nf - at the end of the while loop processing stores the
+	 * number of subfields (or parts) that were found in this string.
+	 *
+	 * field[] - pointers to field strings are stored in this array
+	 *
+	 * field[index] - stores the pointer to the subfield string
+	 *
+	 * Replace the found non-alpha-numeric delimiters with \0 (to denote
+	 * the subfield delimiters).
+	 *
+	 * */
 
-	/* parse this string... */
+#ifdef USE_SSE
+
+	/* Define alphanumeric characters in the range. */
+    char range_raw[N_CHAR_SIMD] = {'0','9','A','Z','a','z','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0'};
+    int range_len; /* how long are our pairs that define ranges */
+    __m128i range; /* the range of characters that we accept in the date */
+    __m128i replace; /* what the fillers/delimiters such as -,: should be replaced with - usually with null byte: \0 */
+    int str_len; /* the lenght of the input src */
+    int aligned16_reps;
+    int aligned16_len;
+    char *target;
+
+    str_len = strlen(str);
+    aligned16_reps = str_len<<4 + 1; // /16 + 1
+    aligned16_len = aligned16_reps >> 4; // *16
+
+    target = (char*) palloc(aligned16_len);
+    strncpy(target, str, aligned16_len);
+    str = target;
+
+    range_len = strlen(range_raw);
+    range = _mm_loadu_si128((__m128i*)range_raw);
+    replace = _mm_set1_epi8('\0');
+    notInRangeToReplace(str, aligned16_len, replace, range, range_len);
+
+    /*
+      Find the number of subfields in the date and set up the pointers to the subfields.
+     */
+    for(i=0; i<str_len; ++i) {
+		while(str[i] == '\0') ++i;
+		if(i>=str_len) break;
+		field[nf] = str+i;
+		if (nf < MAXDATEFIELDS) ++nf;
+		else break;
+		++i;
+		while(str[i] != '\0') ++i;
+    }
+
+#else
 	while (*str != '\0' && nf < MAXDATEFIELDS)
 	{
-		/* skip field separators */
+		/* skip field separators - it allows separators at the beginning of the string !!! */
 		while (*str != '\0' && !isalnum((unsigned char) *str))
 			str++;
 
@@ -2472,6 +2587,11 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 			return DTERR_BAD_FORMAT;	/* end of string after separator */
 
 		field[nf] = str;
+		/**
+		 * Adam: It does not take into account that someone could mix-up digits
+		 * with some letters! it would be better to have just one while loop
+		 * and check for alphanumerics.
+		 */
 		if (isdigit((unsigned char) *str))
 		{
 			while (isdigit((unsigned char) *str))
@@ -2483,12 +2603,18 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 				str++;
 		}
 
-		/* Just get rid of any non-digit, non-alpha characters... */
+		/* Just get rid of any non-digit, non-alpha characters...
+		 *
+		 * Adam: no - this is to finish this subfield with the null character.
+		 *
+		 * */
 		if (*str != '\0')
 			*str++ = '\0';
 		nf++;
 	}
+#endif
 
+    *tmask = 0;
 	/* look first for text fields, since that will be unambiguous month */
 	for (i = 0; i < nf; i++)
 	{
@@ -2546,7 +2672,7 @@ DecodeDate(char *str, int fmask, int *tmask, bool *is2digits,
 		return DTERR_BAD_FORMAT;
 
 	/* validation of the field values must wait until ValidateDate() */
-
+	pfree(target);
 	return 0;
 }
 
