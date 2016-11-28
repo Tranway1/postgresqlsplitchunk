@@ -44,6 +44,9 @@
 #ifndef POSTGRES_H
 #define POSTGRES_H
 
+/* Specify if you want to use the SIMD instructions. */
+//#define USE_SSE
+
 #include "c.h"
 #include "utils/elog.h"
 #include "utils/palloc.h"
