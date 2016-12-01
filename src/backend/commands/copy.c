@@ -67,7 +67,7 @@
 	/* for SIMD instructions */
 	#include <immintrin.h>
 	/* how many characters can be stored in SIMD registers */
-	#define N_CHAR_SIMD 16
+	#define N_CHAR_SIMD (16)
 
 	#define MIN(a,b) ((a) < (b) ? a : b)
 
@@ -319,6 +319,791 @@ if (1) \
 	goto not_end_of_copy; \
 } else ((void) 0)
 
+/* DECLARATION FOR SIMD */
+#define MASK_SIZE (8)
+#define MASK_BIT_LEN (256)
+
+const int MASK_MATCH_0_7[MASK_BIT_LEN][MASK_SIZE] =
+{
+    /*0*/{},  /* no match found */
+    /*1*/{0}, /* position 0 matches */
+    /*2*/{1},
+{0,1},
+{2},
+{0,2},
+{1,2},
+{0,1,2},
+{3},
+{0,3},
+{1,3},
+{0,1,3},
+{2,3},
+{0,2,3},
+{1,2,3},
+{0,1,2,3},
+{4},
+{0,4},
+{1,4},
+{0,1,4},
+{2,4},
+{0,2,4},
+{1,2,4},
+{0,1,2,4},
+{3,4},
+{0,3,4},
+{1,3,4},
+{0,1,3,4},
+{2,3,4},
+{0,2,3,4},
+{1,2,3,4},
+{0,1,2,3,4},
+{5},
+{0,5},
+{1,5},
+{0,1,5},
+{2,5},
+{0,2,5},
+{1,2,5},
+{0,1,2,5},
+{3,5},
+{0,3,5},
+{1,3,5},
+{0,1,3,5},
+{2,3,5},
+{0,2,3,5},
+{1,2,3,5},
+{0,1,2,3,5},
+{4,5},
+{0,4,5},
+{1,4,5},
+{0,1,4,5},
+{2,4,5},
+{0,2,4,5},
+{1,2,4,5},
+{0,1,2,4,5},
+{3,4,5},
+{0,3,4,5},
+{1,3,4,5},
+{0,1,3,4,5},
+{2,3,4,5},
+{0,2,3,4,5},
+{1,2,3,4,5},
+{0,1,2,3,4,5},
+{6},
+{0,6},
+{1,6},
+{0,1,6},
+{2,6},
+{0,2,6},
+{1,2,6},
+{0,1,2,6},
+{3,6},
+{0,3,6},
+{1,3,6},
+{0,1,3,6},
+{2,3,6},
+{0,2,3,6},
+{1,2,3,6},
+{0,1,2,3,6},
+{4,6},
+{0,4,6},
+{1,4,6},
+{0,1,4,6},
+{2,4,6},
+{0,2,4,6},
+{1,2,4,6},
+{0,1,2,4,6},
+{3,4,6},
+{0,3,4,6},
+{1,3,4,6},
+{0,1,3,4,6},
+{2,3,4,6},
+{0,2,3,4,6},
+{1,2,3,4,6},
+{0,1,2,3,4,6},
+{5,6},
+{0,5,6},
+{1,5,6},
+{0,1,5,6},
+{2,5,6},
+{0,2,5,6},
+{1,2,5,6},
+{0,1,2,5,6},
+{3,5,6},
+{0,3,5,6},
+{1,3,5,6},
+{0,1,3,5,6},
+{2,3,5,6},
+{0,2,3,5,6},
+{1,2,3,5,6},
+{0,1,2,3,5,6},
+{4,5,6},
+{0,4,5,6},
+{1,4,5,6},
+{0,1,4,5,6},
+{2,4,5,6},
+{0,2,4,5,6},
+{1,2,4,5,6},
+{0,1,2,4,5,6},
+{3,4,5,6},
+{0,3,4,5,6},
+{1,3,4,5,6},
+{0,1,3,4,5,6},
+{2,3,4,5,6},
+{0,2,3,4,5,6},
+{1,2,3,4,5,6},
+{0,1,2,3,4,5,6},
+{7},
+{0,7},
+{1,7},
+{0,1,7},
+{2,7},
+{0,2,7},
+{1,2,7},
+{0,1,2,7},
+{3,7},
+{0,3,7},
+{1,3,7},
+{0,1,3,7},
+{2,3,7},
+{0,2,3,7},
+{1,2,3,7},
+{0,1,2,3,7},
+{4,7},
+{0,4,7},
+{1,4,7},
+{0,1,4,7},
+{2,4,7},
+{0,2,4,7},
+{1,2,4,7},
+{0,1,2,4,7},
+{3,4,7},
+{0,3,4,7},
+{1,3,4,7},
+{0,1,3,4,7},
+{2,3,4,7},
+{0,2,3,4,7},
+{1,2,3,4,7},
+{0,1,2,3,4,7},
+{5,7},
+{0,5,7},
+{1,5,7},
+{0,1,5,7},
+{2,5,7},
+{0,2,5,7},
+{1,2,5,7},
+{0,1,2,5,7},
+{3,5,7},
+{0,3,5,7},
+{1,3,5,7},
+{0,1,3,5,7},
+{2,3,5,7},
+{0,2,3,5,7},
+{1,2,3,5,7},
+{0,1,2,3,5,7},
+{4,5,7},
+{0,4,5,7},
+{1,4,5,7},
+{0,1,4,5,7},
+{2,4,5,7},
+{0,2,4,5,7},
+{1,2,4,5,7},
+{0,1,2,4,5,7},
+{3,4,5,7},
+{0,3,4,5,7},
+{1,3,4,5,7},
+{0,1,3,4,5,7},
+{2,3,4,5,7},
+{0,2,3,4,5,7},
+{1,2,3,4,5,7},
+{0,1,2,3,4,5,7},
+{6,7},
+{0,6,7},
+{1,6,7},
+{0,1,6,7},
+{2,6,7},
+{0,2,6,7},
+{1,2,6,7},
+{0,1,2,6,7},
+{3,6,7},
+{0,3,6,7},
+{1,3,6,7},
+{0,1,3,6,7},
+{2,3,6,7},
+{0,2,3,6,7},
+{1,2,3,6,7},
+{0,1,2,3,6,7},
+{4,6,7},
+{0,4,6,7},
+{1,4,6,7},
+{0,1,4,6,7},
+{2,4,6,7},
+{0,2,4,6,7},
+{1,2,4,6,7},
+{0,1,2,4,6,7},
+{3,4,6,7},
+{0,3,4,6,7},
+{1,3,4,6,7},
+{0,1,3,4,6,7},
+{2,3,4,6,7},
+{0,2,3,4,6,7},
+{1,2,3,4,6,7},
+{0,1,2,3,4,6,7},
+{5,6,7},
+{0,5,6,7},
+{1,5,6,7},
+{0,1,5,6,7},
+{2,5,6,7},
+{0,2,5,6,7},
+{1,2,5,6,7},
+{0,1,2,5,6,7},
+{3,5,6,7},
+{0,3,5,6,7},
+{1,3,5,6,7},
+{0,1,3,5,6,7},
+{2,3,5,6,7},
+{0,2,3,5,6,7},
+{1,2,3,5,6,7},
+{0,1,2,3,5,6,7},
+{4,5,6,7},
+{0,4,5,6,7},
+{1,4,5,6,7},
+{0,1,4,5,6,7},
+{2,4,5,6,7},
+{0,2,4,5,6,7},
+{1,2,4,5,6,7},
+{0,1,2,4,5,6,7},
+{3,4,5,6,7},
+{0,3,4,5,6,7},
+{1,3,4,5,6,7},
+{0,1,3,4,5,6,7},
+{2,3,4,5,6,7},
+{0,2,3,4,5,6,7},
+{1,2,3,4,5,6,7},
+{0,1,2,3,4,5,6,7}
+};
+
+const int MASK_MATCH_8_15[MASK_BIT_LEN][MASK_SIZE] = {
+{},
+{8},
+{9},
+{8,9},
+{10},
+{8,10},
+{9,10},
+{8,9,10},
+{11},
+{8,11},
+{9,11},
+{8,9,11},
+{10,11},
+{8,10,11},
+{9,10,11},
+{8,9,10,11},
+{12},
+{8,12},
+{9,12},
+{8,9,12},
+{10,12},
+{8,10,12},
+{9,10,12},
+{8,9,10,12},
+{11,12},
+{8,11,12},
+{9,11,12},
+{8,9,11,12},
+{10,11,12},
+{8,10,11,12},
+{9,10,11,12},
+{8,9,10,11,12},
+{13},
+{8,13},
+{9,13},
+{8,9,13},
+{10,13},
+{8,10,13},
+{9,10,13},
+{8,9,10,13},
+{11,13},
+{8,11,13},
+{9,11,13},
+{8,9,11,13},
+{10,11,13},
+{8,10,11,13},
+{9,10,11,13},
+{8,9,10,11,13},
+{12,13},
+{8,12,13},
+{9,12,13},
+{8,9,12,13},
+{10,12,13},
+{8,10,12,13},
+{9,10,12,13},
+{8,9,10,12,13},
+{11,12,13},
+{8,11,12,13},
+{9,11,12,13},
+{8,9,11,12,13},
+{10,11,12,13},
+{8,10,11,12,13},
+{9,10,11,12,13},
+{8,9,10,11,12,13},
+{14},
+{8,14},
+{9,14},
+{8,9,14},
+{10,14},
+{8,10,14},
+{9,10,14},
+{8,9,10,14},
+{11,14},
+{8,11,14},
+{9,11,14},
+{8,9,11,14},
+{10,11,14},
+{8,10,11,14},
+{9,10,11,14},
+{8,9,10,11,14},
+{12,14},
+{8,12,14},
+{9,12,14},
+{8,9,12,14},
+{10,12,14},
+{8,10,12,14},
+{9,10,12,14},
+{8,9,10,12,14},
+{11,12,14},
+{8,11,12,14},
+{9,11,12,14},
+{8,9,11,12,14},
+{10,11,12,14},
+{8,10,11,12,14},
+{9,10,11,12,14},
+{8,9,10,11,12,14},
+{13,14},
+{8,13,14},
+{9,13,14},
+{8,9,13,14},
+{10,13,14},
+{8,10,13,14},
+{9,10,13,14},
+{8,9,10,13,14},
+{11,13,14},
+{8,11,13,14},
+{9,11,13,14},
+{8,9,11,13,14},
+{10,11,13,14},
+{8,10,11,13,14},
+{9,10,11,13,14},
+{8,9,10,11,13,14},
+{12,13,14},
+{8,12,13,14},
+{9,12,13,14},
+{8,9,12,13,14},
+{10,12,13,14},
+{8,10,12,13,14},
+{9,10,12,13,14},
+{8,9,10,12,13,14},
+{11,12,13,14},
+{8,11,12,13,14},
+{9,11,12,13,14},
+{8,9,11,12,13,14},
+{10,11,12,13,14},
+{8,10,11,12,13,14},
+{9,10,11,12,13,14},
+{8,9,10,11,12,13,14},
+{15},
+{8,15},
+{9,15},
+{8,9,15},
+{10,15},
+{8,10,15},
+{9,10,15},
+{8,9,10,15},
+{11,15},
+{8,11,15},
+{9,11,15},
+{8,9,11,15},
+{10,11,15},
+{8,10,11,15},
+{9,10,11,15},
+{8,9,10,11,15},
+{12,15},
+{8,12,15},
+{9,12,15},
+{8,9,12,15},
+{10,12,15},
+{8,10,12,15},
+{9,10,12,15},
+{8,9,10,12,15},
+{11,12,15},
+{8,11,12,15},
+{9,11,12,15},
+{8,9,11,12,15},
+{10,11,12,15},
+{8,10,11,12,15},
+{9,10,11,12,15},
+{8,9,10,11,12,15},
+{13,15},
+{8,13,15},
+{9,13,15},
+{8,9,13,15},
+{10,13,15},
+{8,10,13,15},
+{9,10,13,15},
+{8,9,10,13,15},
+{11,13,15},
+{8,11,13,15},
+{9,11,13,15},
+{8,9,11,13,15},
+{10,11,13,15},
+{8,10,11,13,15},
+{9,10,11,13,15},
+{8,9,10,11,13,15},
+{12,13,15},
+{8,12,13,15},
+{9,12,13,15},
+{8,9,12,13,15},
+{10,12,13,15},
+{8,10,12,13,15},
+{9,10,12,13,15},
+{8,9,10,12,13,15},
+{11,12,13,15},
+{8,11,12,13,15},
+{9,11,12,13,15},
+{8,9,11,12,13,15},
+{10,11,12,13,15},
+{8,10,11,12,13,15},
+{9,10,11,12,13,15},
+{8,9,10,11,12,13,15},
+{14,15},
+{8,14,15},
+{9,14,15},
+{8,9,14,15},
+{10,14,15},
+{8,10,14,15},
+{9,10,14,15},
+{8,9,10,14,15},
+{11,14,15},
+{8,11,14,15},
+{9,11,14,15},
+{8,9,11,14,15},
+{10,11,14,15},
+{8,10,11,14,15},
+{9,10,11,14,15},
+{8,9,10,11,14,15},
+{12,14,15},
+{8,12,14,15},
+{9,12,14,15},
+{8,9,12,14,15},
+{10,12,14,15},
+{8,10,12,14,15},
+{9,10,12,14,15},
+{8,9,10,12,14,15},
+{11,12,14,15},
+{8,11,12,14,15},
+{9,11,12,14,15},
+{8,9,11,12,14,15},
+{10,11,12,14,15},
+{8,10,11,12,14,15},
+{9,10,11,12,14,15},
+{8,9,10,11,12,14,15},
+{13,14,15},
+{8,13,14,15},
+{9,13,14,15},
+{8,9,13,14,15},
+{10,13,14,15},
+{8,10,13,14,15},
+{9,10,13,14,15},
+{8,9,10,13,14,15},
+{11,13,14,15},
+{8,11,13,14,15},
+{9,11,13,14,15},
+{8,9,11,13,14,15},
+{10,11,13,14,15},
+{8,10,11,13,14,15},
+{9,10,11,13,14,15},
+{8,9,10,11,13,14,15},
+{12,13,14,15},
+{8,12,13,14,15},
+{9,12,13,14,15},
+{8,9,12,13,14,15},
+{10,12,13,14,15},
+{8,10,12,13,14,15},
+{9,10,12,13,14,15},
+{8,9,10,12,13,14,15},
+{11,12,13,14,15},
+{8,11,12,13,14,15},
+{9,11,12,13,14,15},
+{8,9,11,12,13,14,15},
+{10,11,12,13,14,15},
+{8,10,11,12,13,14,15},
+{9,10,11,12,13,14,15},
+{8,9,10,11,12,13,14,15}
+
+};
+
+/* mask length in number of bytes */
+const int MASK_MATCH_LEN[MASK_BIT_LEN] =
+{
+0,
+1,
+1,
+2,
+1,
+2,
+2,
+3,
+1,
+2,
+2,
+3,
+2,
+3,
+3,
+4,
+1,
+2,
+2,
+3,
+2,
+3,
+3,
+4,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+1,
+2,
+2,
+3,
+2,
+3,
+3,
+4,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+1,
+2,
+2,
+3,
+2,
+3,
+3,
+4,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+4,
+5,
+5,
+6,
+5,
+6,
+6,
+7,
+1,
+2,
+2,
+3,
+2,
+3,
+3,
+4,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+4,
+5,
+5,
+6,
+5,
+6,
+6,
+7,
+2,
+3,
+3,
+4,
+3,
+4,
+4,
+5,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+4,
+5,
+5,
+6,
+5,
+6,
+6,
+7,
+3,
+4,
+4,
+5,
+4,
+5,
+5,
+6,
+4,
+5,
+5,
+6,
+5,
+6,
+6,
+7,
+4,
+5,
+5,
+6,
+5,
+6,
+6,
+7,
+5,
+6,
+6,
+7,
+6,
+7,
+7,
+8
+};
+
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 /* non-export function prototypes */
@@ -344,11 +1129,13 @@ static bool CopyReadLine(CopyState cstate);
 
 #ifdef USE_SSE
 	static int findFirstDelimiter(const char *src, int src_len, __m128i delimiters, int delimiters_len);
+	static int findDelimiterIndexes(char *src, const int src_len, const __m128i delimiters, const int delimiters_len, int indexes[]);
 #endif // USE_SSE
 
 static bool CopyReadLineText(CopyState cstate);
 static int CopyReadAttributesText(CopyState cstate);
 static int CopyReadAttributesCSV(CopyState cstate);
+static int CopyReadAttributesCSV2(CopyState cstate);
 static Datum CopyReadBinaryAttribute(CopyState cstate, int column_no,
 		FmgrInfo *flinfo, Oid typioparam, int32 typmod, bool *isnull);
 static void CopyAttributeOutText(CopyState cstate, char *string);
@@ -2836,7 +3623,7 @@ bool NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields) {
 	 * the pointers to the begining of each field in the attribute buffer.  */
 	getTime(&startFields,NULL); // start time - find fields in the line
 	if (cstate->csv_mode)
-		fldct = CopyReadAttributesCSV(cstate);
+		fldct = CopyReadAttributesCSV2(cstate);
 	else
 		fldct = CopyReadAttributesText(cstate);
 	getTime(&stopFields,NULL); // stop time for finding fields in the line
@@ -3919,6 +4706,70 @@ static int CopyReadAttributesText(CopyState cstate) {
 	return fieldno;
 }
 
+#ifdef USE_SSE
+
+/**
+   Get the positions of the delimiters for the next 16 characters.
+   Return number of positions found.
+*/
+int findDelimiterIndexes(char *src, const int src_len, const __m128i delimiters, const int delimiters_len, int indexes[]) {
+    int current_data_len; /* The length of the src data. */
+    __m128i data; /* The chunk of src loaded to SIMD registers. */
+    int result_simd; /* The 16 byte mask - with non alphanumeric bytes set to 1. */
+    //char *address; /* The current address in src for processing. */
+    int result_len = 0;
+    //int i; /* to iterate through characters */
+    //int index; /* the index of the first character in src where the delimter was found */
+
+    unsigned int bits0_7;
+    unsigned int bits8_15;
+
+    current_data_len = MIN(src_len, N_CHAR_SIMD);
+    //printf("current_data_len: %d\n", current_data_len);
+    if (current_data_len == N_CHAR_SIMD) {
+    	data = _mm_loadu_si128((__m128i*)(src));
+    } else { // the for loop checks if there is zero characters left, so if we are here then there has to be at least one character more
+    	// just copy the data to local buffer to ensure there are enough bytes to copy to SIMD register
+    	char remaining_data[N_CHAR_SIMD] = {};
+    	strncpy(remaining_data, src, current_data_len);
+    	//printf("remaining data: %s\n", remaining_data);
+    	data = _mm_loadu_si128((__m128i*)remaining_data);
+    }
+    //printf("before executing simd\n");
+    result_simd =  _mm_cvtsi128_si32(_mm_cmpestrm(delimiters, delimiters_len, data, N_CHAR_SIMD, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK));
+    //index = _mm_cmpestri(delimiters, delimiters_len, data, N_CHAR_SIMD, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY);
+    //printf("first index found: %d\n", index);
+    //printf("result simd: %d\n", result_simd);
+    bits0_7 = result_simd & 0x000000FF;
+    //printf("0_7bits: %d\n", bits0_7);
+    // get next 8 bits
+    bits8_15 = (result_simd>>8) & 0x000000FF;
+    //printf("8_15bits: %d\n", bits8_15);
+    //unsigned int bits16_23 = result_simd & 0x00FF0000;
+    //printf("16_23bits: %d\n", bits16_23);
+    //unsigned int bits24_31 = result_simd & 0xFF000000;
+    //printf("24_32bits: %d\n", bits24_31);
+
+    //printf("result_len: %d\n", result_len);
+    //printf("MASK_MATCH[bits0_7]: %d\n", MASK_MATCH[bits0_7][1]);
+    //printf("MASK_MATCH[bits8_15]: %d\n", MASK_MATCH[bits8_15][0]);
+    memcpy(indexes, MASK_MATCH_0_7[bits0_7], MASK_MATCH_LEN[bits0_7]*sizeof(int));
+    memcpy(indexes+MASK_MATCH_LEN[bits0_7], MASK_MATCH_8_15[bits8_15], MASK_MATCH_LEN[bits8_15]*sizeof(int));
+    result_len += MASK_MATCH_LEN[bits0_7] + MASK_MATCH_LEN[bits8_15];
+    //#printf("indexes:\n");
+    //for (i=0; i<result_len; ++i) {
+    //printf("%d ", indexes[i]);
+    //}
+    //printf("\n");
+    /* const int *mask0_7 = MASK_MATCH[low0_7bits]; */
+    /* for (int i=0; i<MASK_SIZE; ++i) { */
+    /*     printf("mask position %d is: %d\n", i, mask0_7[i]); */
+    /* } */
+    return result_len;
+}
+
+#endif // USE_SSE
+
 /*
  * Adam: This is where a lot of processing happens. We have to parse the whole line
  * and find the field delimiters in the line (the line was extracted from the
@@ -3955,6 +4806,23 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 	char *cur_ptr;
 	/* Adam: The pointer to the end of the line buffer. */
 	char *line_end_ptr;
+
+	#ifdef USE_SSE
+		int indexes[N_CHAR_SIMD] = {}; /* new index for a found delimiter - by SIMD instruction */
+		int indexes_count = 0; /* how many indices were found */
+		int simd_count = 0; /* to which position in the simd indexes we reached */
+
+		char * simd_ptr; /* the pointer to the baseline from which the simd characters were found */
+		char * next_simd_ptr; /* point to the next hop for simd, keep the simd_ptr as the baseline from which new
+		characters for processing are extracted */
+		char * simd_del_ptr; // next simd delimiter pointer
+
+		__m128i delimiters; /* the delimiters that we are searching for in the SIMD format */
+		char raw_delimiters[N_CHAR_SIMD] = {}; /* the delimiters that we search for (the raw format) */
+		int delimiters_len = 0; /* the number of delimiters - initially set to 0 */
+		//int i; /* to iterate in the for loop */
+
+	#endif
 
 	/*
 	 * Adam: this is a very very precise processing - a table can have zero
@@ -3993,6 +4861,23 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 	/* Adam: line_end_ptr - is to the end of the line buffer. */
 	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
 
+	#ifdef USE_SSE
+		raw_delimiters[delimiters_len++] = delimc;
+		if (quotec != '\0') {
+			raw_delimiters[delimiters_len++] = quotec;
+		}
+//		elog(DEBUG1, "delimiters length: %d", delimiters_len);
+//		elog(DEBUG1, "delimiters: %s", raw_delimiters);
+		/* The number of delimiters that we can check in one go has to be lower
+		 * than the SIMD register width. */
+		/* Load the delimiters to SIMD register. */
+		delimiters = _mm_loadu_si128((__m128i*)raw_delimiters);
+		simd_ptr = cur_ptr;
+		next_simd_ptr = cur_ptr; /* This is only initialization - we start later on from assigning next_simd_ptr to simd_ptr;
+		we need the next_simd_ptr to jump to the next 16 bytes if nothing was found in the previous 16 characters. */
+
+	#endif // USE_SSE
+
 	/* Outer loop iterates over fields */
 	fieldno = 0;
 	for (;;) {
@@ -4005,6 +4890,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		/* Adam: The length of the current field. */
 		int input_len;
 
+//		elog(DEBUG1, "cur_ptr: %s", cur_ptr);
 		/* Make sure there is enough space for the next value */
 		if (fieldno >= cstate->max_fields) {
 			cstate->max_fields *= 2;
@@ -4013,7 +4899,8 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		}
 
 		/* start_ptr point to the beginning of the line buffer
-		 * (cstate->line_buf.data) at the start of processing of the line. */
+		 * (cstate->line_buf.data) at the start of processing of the line. Next,
+		 * to the beginning of each new field. */
 		start_ptr = cur_ptr;
 		/* Remember start of field on both input and output sides,
 		 * the output_ptr points to the beginning of the attribute data buffer
@@ -4035,19 +4922,77 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 
 			/* Not in quote */
 			for (;;) {
-				/* at the end of the field processing it should point to the
-				 * next char after the field. */
-				end_ptr = cur_ptr;
 				/* Adam: this is more like the end of the processing of this
 				 * line from cstate->line_buf.data, but at the same time if the
 				 * line finished then you also finished processing of this very
 				 * field. */
-				if (cur_ptr >= line_end_ptr) {
+#ifdef USE_SSE
+				/**
+				 * If cur_ptr reached the end of buffer then do nothing.
+				 *
+				 * If there are still some more data and our simd count traversed
+				 * all the indexes returned by simd then search for new delimiters for fields.
+				 *
+
+				 *
+				 */
+//				elog(DEBUG1, "raw delimiters: %s", raw_delimiters);
+//				elog(DEBUG1, "cur_ptr: %s", cur_ptr);
+//				elog(DEBUG1, "simd_count: %d", simd_count);
+//				elog(DEBUG1, "indexes_count: %d", indexes_count);
+//				elog(DEBUG1, "simd_ptr: %s", simd_ptr);
+//				elog(DEBUG1, "indexes:");
+//				for (i=0; i<indexes_count; ++i) {
+//					elog(DEBUG1, "%d: ", indexes[i]);
+//				}
+				/*
+				 * If there are still some simd delimiters to process but the
+				 * cur_ptr already traversed some of them then move to the search
+				 * for the first non-processed delimiter or search for new ones.
+				 */
+				while(simd_count < indexes_count && cur_ptr > simd_ptr + indexes[simd_count]) {
+					++simd_count;
+				}
+				/*
+				 * If there are still some more data and our simd count traversed
+				 * all the indexes returned by simd then search for new delimiters for fields.
+				 */
+				while (next_simd_ptr < line_end_ptr && simd_count >= indexes_count) {
+//					elog(DEBUG1, "Search for new characters: %s\n", next_simd_ptr);
+					simd_ptr = next_simd_ptr;
+					indexes_count = findDelimiterIndexes(simd_ptr, line_end_ptr - simd_ptr, delimiters, delimiters_len, indexes);
+					next_simd_ptr += N_CHAR_SIMD;
+					simd_count = 0;
+				}
+//				elog(DEBUG1, "cur_ptr2: %s", cur_ptr);
+//				elog(DEBUG1, "simd_count2: %d", simd_count);
+//				elog(DEBUG1, "indexes_count2: %d", indexes_count);
+//				elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
+//				elog(DEBUG1, "indexes2:");
+//				for (i=0; i<indexes_count; ++i) {
+//					elog(DEBUG1, "%d: ", indexes[i]);
+//				}
+				/*
+				 * There can be the case that no more characters can be searched
+				 * and the simd_count == indexes count. Then we have to stop.
+				 *
+				 * Another thing is that the next_simd_ptr can of course land
+				 * directly on the boundary = line_end_ptr.
+				 */
+				if (cur_ptr >= line_end_ptr || (next_simd_ptr >= line_end_ptr && simd_count >= indexes_count)) {
 					/* Adam: indeed, we do not set found_delim = true; which means
 					 * that we did not found the field delimiter so had to finish
 					 * processing when the line end was encountered, so finish
 					 * this metod for line processing to find fields.
 					 */
+					//elog(DEBUG1, "Copy the remaining characters at the end of the line.");
+					while(cur_ptr < line_end_ptr) {
+						//elog(DEBUG1, "copied character: %c", *cur_ptr);
+						*output_ptr++ = *cur_ptr++;
+					}
+					/* at the end of the field processing it should point to the
+					 * next char after the field. */
+					end_ptr = cur_ptr;
 					goto endfield;
 				}
 				/* Adam: get a/(the next) character from the line buffer.
@@ -4055,12 +5000,37 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				 * This is also where we iterate through the
 				 * characters in the input line from the cstate->line_buf.data buffer.
 				 * */
+//				elog(DEBUG1, "copy_characters for a field:");
+				simd_del_ptr = simd_ptr + indexes[simd_count];
+				while(cur_ptr < simd_del_ptr) {
+//					elog(DEBUG1, "copied character: %c", *cur_ptr);
+					*output_ptr++ = *cur_ptr++;
+				}
+				++simd_count; /* used next delimiter found by simd */
+#else // end of: USE_SSE
+				/* at the end of the field processing it should point to the
+				 * next char after the field.
+				 * */
+				end_ptr = cur_ptr;
+				if (cur_ptr >= line_end_ptr) {
+					goto endfield;
+				}
+#endif
 				c = *cur_ptr++;
 				/* unquoted field delimiter */
 				if (c == delimc) { /* Adam: check if the current character is the field delimiter */
 					found_delim = true;
 					goto endfield;
 				}
+#ifdef USE_SSE
+				/* start of quoted field (or part of a field) */
+				else {
+//					elog(DEBUG1, "character not line delimiter: %c", c);
+					/* can the quoted field show up in the middle of a field? */
+					saw_quote = true;
+					break; /* this break moves you to the "In quote" loop */
+				}
+#else
 				/* start of quoted field (or part of a field) */
 				if (c == quotec) {
 					/* can the quoted field show up in the middle of a field? */
@@ -4068,7 +5038,9 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 					break; /* this break moves you to the "In quote" loop */
 				}
 				/* Add c to output string */
+//				elog(DEBUG1, "copied character: %c", c);
 				*output_ptr++ = c;
+#endif
 			}
 
 			/* In quote */
@@ -4109,13 +5081,13 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				*output_ptr++ = c;
 			}
 		}
-		/* Adam: this is a label for the go to processing - once you are done
+		/* Adam: this is a label for the "go to" processing - once you are done
 		 * with processing of the current field. */
 		endfield:
 
-		/* Terminate attribute value in output area */
+		/* Terminate attribute value in output area. */
 		*output_ptr++ = '\0';
-
+//		elog(DEBUG1, "field data: %s", cstate->raw_fields[fieldno]);
 		/* Check whether raw input matched null marker.
 		 *
 		 * Adam: cstate->null_print is the NULL marker string (server encoding!)
@@ -4124,11 +5096,348 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		 * */
 		input_len = end_ptr - start_ptr; /* the length of the field */
 		if (!saw_quote && input_len == cstate->null_print_len
-				&& strncmp(start_ptr, cstate->null_print, input_len) == 0)
+				&& strncmp(start_ptr, cstate->null_print, input_len) == 0) {
 			cstate->raw_fields[fieldno] = NULL;
+//			elog(DEBUG1, "empty field");
+		}
 
 		/* Adam: increment the number of fields that you found. */
-		fieldno++;
+		++fieldno;
+//		elog(DEBUG1, "fieldno: %d", fieldno);
+		/* Done if we hit EOL instead of a delim */
+		if (!found_delim)
+			break;
+	}
+
+	/* Clean up state of attribute_buf */
+	output_ptr--;
+	Assert(*output_ptr == '\0');
+	cstate->attribute_buf.len = (output_ptr - cstate->attribute_buf.data);
+
+	/* return the number of fields in the line */
+	return fieldno;
+}
+
+/*
+ * Adam: This is where a lot of processing happens. We have to parse the whole line
+ * and find the field delimiters in the line (the line was extracted from the
+ * input raw file by the CopyReadLineText method.
+ *
+ * Parse the current line into separate attributes (fields),
+ * performing de-escaping as needed.  This has exactly the same API as
+ * CopyReadAttributesText, except we parse the fields according to
+ * "standard" (i.e. common) CSV usage.
+ *
+ * @return fieldno - number of fields in the line
+ */
+static int CopyReadAttributesCSV2(CopyState cstate) {
+	/* Adam: column delimiter (must be 1 byte) */
+	char delimc = cstate->delim[0];
+	/* Adam: CSV quote char (must be 1 byte) */
+	char quotec = cstate->quote[0];
+	/* Adam: CSV escape char (must be 1 byte); e.g. escape the quote
+	 * character in the quoted value: "adam\"s" */
+	char escapec = cstate->escape[0];
+	/* Adam: The number of the fields, the enumeration starts from 0, later on:
+	 * fieldno = 0;
+	 * */
+	int fieldno;
+	/* Adam: output_ptr: It points to: the beginning of the attribute buffer,
+	 * the next characters added to attribute buffer (which is the output buffer)
+	 * then the beginning of every new field and finally to the end of the
+	 * attribute_buf.data (at the end of the whole line processing). */
+	char *output_ptr;
+	/* Adam: current pointer to the line_buf - the buffer that keeps the whole
+	 * line (the line_buf is the input buffer for this processing - from a line
+	 * to attributes).
+	 */
+	char *cur_ptr;
+	/* Adam: The pointer to the end of the line buffer. */
+	char *line_end_ptr;
+
+	#ifdef USE_SSE
+		char * simd_ptr; // next simd delimiter pointer
+
+		__m128i delimiters; /* the delimiters that we are searching for in the SIMD format */
+		char raw_delimiters[N_CHAR_SIMD] = {}; /* the delimiters that we search for (the raw format) */
+		int delimiters_len = 0; /* the number of delimiters - initially set to 0 */
+		//int i; /* to iterate in the for loop */
+		int index;
+	#endif
+
+	/*
+	 * Adam: this is a very very precise processing - a table can have zero
+	 * columns :)
+	 *
+	 * We need a special case for zero-column tables: check that the input
+	 * line is empty, and return.
+	 */
+	if (cstate->max_fields <= 0) {
+		if (cstate->line_buf.len != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT), errmsg("extra data after last expected column")));
+		return 0;
+	}
+
+	/* Adam: just prepare the buffer for the attributes (attribute_buf). */
+	resetStringInfo(&cstate->attribute_buf);
+
+	/*
+	 * The de-escaped attributes will certainly not be longer than the input
+	 * data line, so we can just force attribute_buf to be large enough and
+	 * then transfer data without any checks for enough space.  We need to do
+	 * it this way because enlarging attribute_buf mid-stream would invalidate
+	 * pointers already stored into cstate->raw_fields[].
+	 */
+	if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
+		enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
+	/* Adam: We add the characters to the output buffer (attribute_buf.data
+	 * using the output_ptr!
+	 */
+	output_ptr = cstate->attribute_buf.data;
+
+	/* set pointer variables for loop */
+	/* Adam: the current pointer is at the beginning of the line buffer at the start. */
+	cur_ptr = cstate->line_buf.data;
+	/* Adam: line_end_ptr - is to the end of the line buffer. */
+	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
+
+	#ifdef USE_SSE
+		raw_delimiters[delimiters_len++] = delimc;
+		if (quotec != '\0') {
+			raw_delimiters[delimiters_len++] = quotec;
+		}
+//		elog(DEBUG1, "delimiters length: %d", delimiters_len);
+//		elog(DEBUG1, "delimiters: %s", raw_delimiters);
+		/* The number of delimiters that we can check in one go has to be lower
+		 * than the SIMD register width. */
+		/* Load the delimiters to SIMD register. */
+		delimiters = _mm_loadu_si128((__m128i*)raw_delimiters);
+		//simd_ptr = cur_ptr;
+
+	#endif // USE_SSE
+
+	/* Outer loop iterates over fields */
+	fieldno = 0;
+	for (;;) {
+		bool found_delim = false;
+		bool saw_quote = false;
+		/* Adam: start pointer of the field in the attribute buffer. */
+		char *start_ptr;
+		/* Adam: The end pointer of the field in the attribute buffer. */
+		char *end_ptr;
+		/* Adam: The length of the current field. */
+		int input_len;
+
+//		elog(DEBUG1, "cur_ptr: %s", cur_ptr);
+		/* Make sure there is enough space for the next value */
+		if (fieldno >= cstate->max_fields) {
+			cstate->max_fields *= 2;
+			cstate->raw_fields = repalloc(cstate->raw_fields,
+					cstate->max_fields * sizeof(char *));
+		}
+
+		/* start_ptr point to the beginning of the line buffer
+		 * (cstate->line_buf.data) at the start of processing of the line. Next,
+		 * to the beginning of each new field. */
+		start_ptr = cur_ptr;
+		/* Remember start of field on both input and output sides,
+		 * the output_ptr points to the beginning of the attribute data buffer
+		 * at the start and later on to the beginning of each field.
+		 *
+		 * Adam: in the raw_fields store the pointers to the beginning of
+		 * attributes stored in the attribute_buf. */
+		cstate->raw_fields[fieldno] = output_ptr;
+
+		/*
+		 * Scan data for fields.
+		 *
+		 * The loop starts in "not quote" mode and then toggles between that
+		 * and "in quote" mode. The loop exits normally if it is in "not
+		 * quote" mode and a delimiter or line end is seen.
+		 */
+		for (;;) {
+			char c;
+
+			/* Not in quote */
+			for (;;) {
+				/* Adam: this is more like the end of the processing of this
+				 * line from cstate->line_buf.data, but at the same time if the
+				 * line finished then you also finished processing of this very
+				 * field. */
+#ifdef USE_SSE
+				/**
+				 * If cur_ptr reached the end of buffer then do nothing.
+				 *
+				 * If there are still some more data and our simd count traversed
+				 * all the indexes returned by simd then search for new delimiters for fields.
+				 *
+
+				 *
+				 */
+				//elog(DEBUG1, "raw delimiters: %s", raw_delimiters);
+				//elog(DEBUG1, "cur_ptr: %s", cur_ptr);
+//				elog(DEBUG1, "simd_count: %d", simd_count);
+//				elog(DEBUG1, "indexes_count: %d", indexes_count);
+				//elog(DEBUG1, "simd_ptr: %s", simd_ptr);
+//				elog(DEBUG1, "indexes:");
+//				for (i=0; i<indexes_count; ++i) {
+//					elog(DEBUG1, "%d: ", indexes[i]);
+//				}
+				/*
+				 * If there are still some simd delimiters to process but the
+				 * cur_ptr already traversed some of them then move to the search
+				 * for the first non-processed delimiter or search for new ones.
+				 */
+				/*
+				 * If there are still some more data and our simd count traversed
+				 * all the indexes returned by simd then search for new delimiters for fields.
+				 */
+//					elog(DEBUG1, "Search for new characters: %s\n", next_simd_ptr);
+				index = findFirstDelimiter(cur_ptr, line_end_ptr - cur_ptr, delimiters, delimiters_len);
+
+				//elog(DEBUG1, "INDEX: %d", index);
+				//elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
+//				elog(DEBUG1, "cur_ptr2: %s", cur_ptr);
+//				elog(DEBUG1, "simd_count2: %d", simd_count);
+//				elog(DEBUG1, "indexes_count2: %d", indexes_count);
+//				elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
+//				elog(DEBUG1, "indexes2:");
+//				for (i=0; i<indexes_count; ++i) {
+//					elog(DEBUG1, "%d: ", indexes[i]);
+//				}
+				/*
+				 * There can be the case that no more characters can be searched
+				 * and the simd_count == indexes count. Then we have to stop.
+				 *
+				 * Another thing is that the next_simd_ptr can of course land
+				 * directly on the boundary = line_end_ptr.
+				 */
+				if (cur_ptr >= line_end_ptr || index == -1) {
+					/* Adam: indeed, we do not set found_delim = true; which means
+					 * that we did not found the field delimiter so had to finish
+					 * processing when the line end was encountered, so finish
+					 * this metod for line processing to find fields.
+					 */
+					//elog(DEBUG1, "Copy the remaining characters at the end of the line.");
+					while(cur_ptr < line_end_ptr) {
+						//elog(DEBUG1, "copied character: %c", *cur_ptr);
+						*output_ptr++ = *cur_ptr++;
+					}
+					/* at the end of the field processing it should point to the
+					 * next char after the field. */
+					end_ptr = cur_ptr;
+					goto endfield;
+				}
+				/* Adam: get a/(the next) character from the line buffer.
+				 *
+				 * This is also where we iterate through the
+				 * characters in the input line from the cstate->line_buf.data buffer.
+				 * */
+				//simd_ptr += index;
+				//elog(DEBUG1, "copy_characters for a field:");
+				while(index--) {
+					//elog(DEBUG1, "copied character: %c", *cur_ptr);
+					*output_ptr++ = *cur_ptr++;
+				}
+				//++simd_ptr;
+#else // end of: USE_SSE
+				/* at the end of the field processing it should point to the
+				 * next char after the field.
+				 * */
+				end_ptr = cur_ptr;
+				if (cur_ptr >= line_end_ptr) {
+					goto endfield;
+				}
+#endif
+				c = *cur_ptr++;
+				/* unquoted field delimiter */
+				if (c == delimc) { /* Adam: check if the current character is the field delimiter */
+					found_delim = true;
+					goto endfield;
+				}
+#ifdef USE_SSE
+				/* start of quoted field (or part of a field) */
+				else {
+					//elog(DEBUG1, "character not line delimiter: %c", c);
+					/* can the quoted field show up in the middle of a field? */
+					saw_quote = true;
+					break; /* this break moves you to the "In quote" loop */
+				}
+#else
+				/* start of quoted field (or part of a field) */
+				if (c == quotec) {
+					/* can the quoted field show up in the middle of a field? */
+					saw_quote = true;
+					break; /* this break moves you to the "In quote" loop */
+				}
+				/* Add c to output string */
+//				elog(DEBUG1, "copied character: %c", c);
+				*output_ptr++ = c;
+#endif
+			}
+
+			/* In quote */
+			for (;;) {
+				end_ptr = cur_ptr;
+				if (cur_ptr >= line_end_ptr)
+					ereport(ERROR,
+							(errcode(ERRCODE_BAD_COPY_FILE_FORMAT), errmsg("unterminated CSV quoted field")));
+
+				c = *cur_ptr++;
+
+				/* escape within a quoted field */
+				if (c == escapec) {
+					/*
+					 * peek at the next char if available, and escape it if it
+					 * is an escape char or a quote char
+					 */
+					if (cur_ptr < line_end_ptr) {
+						char nextc = *cur_ptr;
+
+						if (nextc == escapec || nextc == quotec) {
+							*output_ptr++ = nextc;
+							cur_ptr++;
+							continue;
+						}
+					}
+				}
+
+				/*
+				 * end of quoted field. Must do this test after testing for
+				 * escape in case quote char and escape char are the same
+				 * (which is the common case).
+				 */
+				if (c == quotec)
+					break;
+
+				/* Add c to output string */
+				*output_ptr++ = c;
+			}
+		}
+		/* Adam: this is a label for the "go to" processing - once you are done
+		 * with processing of the current field. */
+		endfield:
+
+		/* Terminate attribute value in output area. */
+		*output_ptr++ = '\0';
+//		elog(DEBUG1, "field data: %s", cstate->raw_fields[fieldno]);
+		/* Check whether raw input matched null marker.
+		 *
+		 * Adam: cstate->null_print is the NULL marker string (server encoding!)
+		 *
+		 *
+		 * */
+		input_len = end_ptr - start_ptr; /* the length of the field */
+		if (!saw_quote && input_len == cstate->null_print_len
+				&& strncmp(start_ptr, cstate->null_print, input_len) == 0) {
+			cstate->raw_fields[fieldno] = NULL;
+			//elog(DEBUG1, "empty field");
+		}
+
+		/* Adam: increment the number of fields that you found. */
+		++fieldno;
+		//elog(DEBUG1, "fieldno: %d", fieldno);
 		/* Done if we hit EOL instead of a delim */
 		if (!found_delim)
 			break;
