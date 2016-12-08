@@ -58,7 +58,7 @@
 #define DEBUG_TIME true
 
 /* Specify if you want to use the SIMD instructions. */
-//#define USE_SSE
+#define USE_SSE
 
 #ifdef USE_SSE
 
@@ -102,7 +102,7 @@ typedef enum EolType {
  * characters by having the first byte's high bit set. Subsequent bytes of the
  * character can have the high bit not set. When scanning data in such an
  * encoding to look for a match to a single-byte (ie ASCII) character, we must
- * use the full pg_encoding_mblen() machinery to skip over multibyte
+ * use the full pg_encoding_mblen() machinery to skip over mUultibyte
  * characters, else we might find a false match to a trailing byte. In
  * supported server encodings, there is no possibility of a false match, and
  * it's faster to make useless comparisons to trailing bytes than it is to
@@ -4079,15 +4079,15 @@ int findFirstDelimiter(const char *src, const int src_len, const __m128i delimit
 		// mode: unsigned 8-bit characters
 		// mode: compare equal any
 		/* check if these are ASCII characters */
-		mask_epi8 =_mm_movemask_epi8(data);
-		if (mask_epi8 != 0) {
+		//mask_epi8 =_mm_movemask_epi8(data);
+		//if (mask_epi8 != 0) {
 			/* Found non-ASCII characters (more than 1 byte characters).
 			 *
 			 * Return the current batch pointer.
 			 *
 			 * We could have already processed some batches without nonASCII characters.*/
-			return n;
-		}
+			//return n;
+		//}
 		index = _mm_cmpestri(delimiters, delimiters_len, data, current_data_len, _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY);
 		if (index < N_CHAR_SIMD) {
 			return n+index;
@@ -4454,16 +4454,16 @@ static bool CopyReadLineText(CopyState cstate) {
 		 * high-bit set, so as an optimization we can avoid this block
 		 * entirely if it is not set.
 		 */
-		if (cstate->encoding_embeds_ascii && IS_HIGHBIT_SET(c)) {
-			int mblen;
-
-			mblen_str[0] = c;
-			/* All our encodings only read the first byte to get the length */
-			mblen = pg_encoding_mblen(cstate->file_encoding, mblen_str);
-			IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(mblen - 1);
-			IF_NEED_REFILL_AND_EOF_BREAK(mblen - 1);
-			raw_buf_ptr += mblen - 1;
-		}
+//		if (cstate->encoding_embeds_ascii && IS_HIGHBIT_SET(c)) {
+//			int mblen;
+//
+//			mblen_str[0] = c;
+//			/* All our encodings only read the first byte to get the length */
+//			mblen = pg_encoding_mblen(cstate->file_encoding, mblen_str);
+//			IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(mblen - 1);
+//			IF_NEED_REFILL_AND_EOF_BREAK(mblen - 1);
+//			raw_buf_ptr += mblen - 1;
+//		}
 		first_char_in_line = false;
 	} /* end of outer loop */
 
