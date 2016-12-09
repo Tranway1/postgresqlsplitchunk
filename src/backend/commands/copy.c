@@ -327,8 +327,8 @@ const int MASK_MATCH_0_7[MASK_BIT_LEN][MASK_SIZE] =
 {
     /*0*/{},  /* no match found */
     /*1*/{0}, /* position 0 matches */
-    /*2*/{1},
-{0,1},
+    /*2*/{1}, /* position 1 matches */
+	/*1,2*/{0,1}, /* position 0,1 matches */
 {2},
 {0,2},
 {1,2},
@@ -3563,7 +3563,7 @@ CopyState BeginCopyFrom(ParseState *pstate, Relation rel, const char *filename,
 
 	MemoryContextSwitchTo(oldcontext);
 
-	//elog(DEBUG1, "Parse time: %f", cstate->parse/1000.0);
+	////elog(DEBUG1, "Parse time: %f", cstate->parse/1000.0);
 
 	return cstate;
 }
@@ -3708,7 +3708,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
 			return false;
 		getTime(&stopParsing,NULL); // stop time
-		//elog(DEBUG1, "elapsed time: %f", elapsedTime);
+		////elog(DEBUG1, "elapsed time: %f", elapsedTime);
 		cstate->parse += getElapsedTime(startParsing, stopParsing);
 
 		/**
@@ -3840,7 +3840,7 @@ bool NextCopyFrom(CopyState cstate, ExprContext *econtext, Datum *values,
 		Assert(fieldno == nfields);
 
 		getTime(&stopDeserialize,NULL); // stop time
-		//elog(DEBUG1, "elapsed time: %f", elapsedTime);
+		////elog(DEBUG1, "elapsed time: %f", elapsedTime);
 		cstate->deserialize += getElapsedTime(startDeserialize, stopDeserialize);
 	} else {
 		/* binary */
@@ -4866,8 +4866,8 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		if (quotec != '\0') {
 			raw_delimiters[delimiters_len++] = quotec;
 		}
-//		elog(DEBUG1, "delimiters length: %d", delimiters_len);
-//		elog(DEBUG1, "delimiters: %s", raw_delimiters);
+//		//elog(DEBUG1, "delimiters length: %d", delimiters_len);
+//		//elog(DEBUG1, "delimiters: %s", raw_delimiters);
 		/* The number of delimiters that we can check in one go has to be lower
 		 * than the SIMD register width. */
 		/* Load the delimiters to SIMD register. */
@@ -4890,7 +4890,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		/* Adam: The length of the current field. */
 		int input_len;
 
-//		elog(DEBUG1, "cur_ptr: %s", cur_ptr);
+//		//elog(DEBUG1, "cur_ptr: %s", cur_ptr);
 		/* Make sure there is enough space for the next value */
 		if (fieldno >= cstate->max_fields) {
 			cstate->max_fields *= 2;
@@ -4936,14 +4936,14 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 
 				 *
 				 */
-//				elog(DEBUG1, "raw delimiters: %s", raw_delimiters);
-//				elog(DEBUG1, "cur_ptr: %s", cur_ptr);
-//				elog(DEBUG1, "simd_count: %d", simd_count);
-//				elog(DEBUG1, "indexes_count: %d", indexes_count);
-//				elog(DEBUG1, "simd_ptr: %s", simd_ptr);
-//				elog(DEBUG1, "indexes:");
+//elog(DEBUG1, "raw delimiters: %s", raw_delimiters);
+//elog(DEBUG1, "cur_ptr: %s", cur_ptr);
+//elog(DEBUG1, "simd_count: %d", simd_count);
+//elog(DEBUG1, "indexes_count: %d", indexes_count);
+//elog(DEBUG1, "simd_ptr: %s", simd_ptr);
+//elog(DEBUG1, "indexes:");
 //				for (i=0; i<indexes_count; ++i) {
-//					elog(DEBUG1, "%d: ", indexes[i]);
+//					//elog(DEBUG1, "%d: ", indexes[i]);
 //				}
 				/*
 				 * If there are still some simd delimiters to process but the
@@ -4958,19 +4958,19 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				 * all the indexes returned by simd then search for new delimiters for fields.
 				 */
 				while (next_simd_ptr < line_end_ptr && simd_count >= indexes_count) {
-//					elog(DEBUG1, "Search for new characters: %s\n", next_simd_ptr);
+//					//elog(DEBUG1, "Search for new characters: %s\n", next_simd_ptr);
 					simd_ptr = next_simd_ptr;
 					indexes_count = findDelimiterIndexes(simd_ptr, line_end_ptr - simd_ptr, delimiters, delimiters_len, indexes);
 					next_simd_ptr += N_CHAR_SIMD;
 					simd_count = 0;
 				}
-//				elog(DEBUG1, "cur_ptr2: %s", cur_ptr);
-//				elog(DEBUG1, "simd_count2: %d", simd_count);
-//				elog(DEBUG1, "indexes_count2: %d", indexes_count);
-//				elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
-//				elog(DEBUG1, "indexes2:");
+//elog(DEBUG1, "cur_ptr2: %s", cur_ptr);
+//elog(DEBUG1, "simd_count2: %d", simd_count);
+//elog(DEBUG1, "indexes_count2: %d", indexes_count);
+//elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
+//elog(DEBUG1, "indexes2:");
 //				for (i=0; i<indexes_count; ++i) {
-//					elog(DEBUG1, "%d: ", indexes[i]);
+//					//elog(DEBUG1, "%d: ", indexes[i]);
 //				}
 				/*
 				 * There can be the case that no more characters can be searched
@@ -5000,10 +5000,10 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				 * This is also where we iterate through the
 				 * characters in the input line from the cstate->line_buf.data buffer.
 				 * */
-//				elog(DEBUG1, "copy_characters for a field:");
+//elog(DEBUG1, "copy_characters for a field:");
 				simd_del_ptr = simd_ptr + indexes[simd_count];
 				while(cur_ptr < simd_del_ptr) {
-//					elog(DEBUG1, "copied character: %c", *cur_ptr);
+//					//elog(DEBUG1, "copied character: %c", *cur_ptr);
 					*output_ptr++ = *cur_ptr++;
 				}
 				++simd_count; /* used next delimiter found by simd */
@@ -5025,7 +5025,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 #ifdef USE_SSE
 				/* start of quoted field (or part of a field) */
 				else {
-//					elog(DEBUG1, "character not line delimiter: %c", c);
+//					//elog(DEBUG1, "character not line delimiter: %c", c);
 					/* can the quoted field show up in the middle of a field? */
 					saw_quote = true;
 					break; /* this break moves you to the "In quote" loop */
@@ -5038,7 +5038,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 					break; /* this break moves you to the "In quote" loop */
 				}
 				/* Add c to output string */
-//				elog(DEBUG1, "copied character: %c", c);
+//elog(DEBUG1, "copied character: %c", c);
 				*output_ptr++ = c;
 #endif
 			}
@@ -5087,7 +5087,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 
 		/* Terminate attribute value in output area. */
 		*output_ptr++ = '\0';
-//		elog(DEBUG1, "field data: %s", cstate->raw_fields[fieldno]);
+//		//elog(DEBUG1, "field data: %s", cstate->raw_fields[fieldno]);
 		/* Check whether raw input matched null marker.
 		 *
 		 * Adam: cstate->null_print is the NULL marker string (server encoding!)
@@ -5098,12 +5098,12 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 		if (!saw_quote && input_len == cstate->null_print_len
 				&& strncmp(start_ptr, cstate->null_print, input_len) == 0) {
 			cstate->raw_fields[fieldno] = NULL;
-//			elog(DEBUG1, "empty field");
+//			//elog(DEBUG1, "empty field");
 		}
 
 		/* Adam: increment the number of fields that you found. */
 		++fieldno;
-//		elog(DEBUG1, "fieldno: %d", fieldno);
+//		//elog(DEBUG1, "fieldno: %d", fieldno);
 		/* Done if we hit EOL instead of a delim */
 		if (!found_delim)
 			break;
@@ -5207,8 +5207,8 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 		if (quotec != '\0') {
 			raw_delimiters[delimiters_len++] = quotec;
 		}
-//		elog(DEBUG1, "delimiters length: %d", delimiters_len);
-//		elog(DEBUG1, "delimiters: %s", raw_delimiters);
+//		//elog(DEBUG1, "delimiters length: %d", delimiters_len);
+//		//elog(DEBUG1, "delimiters: %s", raw_delimiters);
 		/* The number of delimiters that we can check in one go has to be lower
 		 * than the SIMD register width. */
 		/* Load the delimiters to SIMD register. */
@@ -5229,7 +5229,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 		/* Adam: The length of the current field. */
 		int input_len;
 
-//		elog(DEBUG1, "cur_ptr: %s", cur_ptr);
+//		//elog(DEBUG1, "cur_ptr: %s", cur_ptr);
 		/* Make sure there is enough space for the next value */
 		if (fieldno >= cstate->max_fields) {
 			cstate->max_fields *= 2;
@@ -5277,12 +5277,10 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 				 */
 				//elog(DEBUG1, "raw delimiters: %s", raw_delimiters);
 				//elog(DEBUG1, "cur_ptr: %s", cur_ptr);
-//				elog(DEBUG1, "simd_count: %d", simd_count);
-//				elog(DEBUG1, "indexes_count: %d", indexes_count);
 				//elog(DEBUG1, "simd_ptr: %s", simd_ptr);
-//				elog(DEBUG1, "indexes:");
+				//elog(DEBUG1, "indexes:");
 //				for (i=0; i<indexes_count; ++i) {
-//					elog(DEBUG1, "%d: ", indexes[i]);
+//					//elog(DEBUG1, "%d: ", indexes[i]);
 //				}
 				/*
 				 * If there are still some simd delimiters to process but the
@@ -5293,18 +5291,15 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 				 * If there are still some more data and our simd count traversed
 				 * all the indexes returned by simd then search for new delimiters for fields.
 				 */
-//					elog(DEBUG1, "Search for new characters: %s\n", next_simd_ptr);
+//					//elog(DEBUG1, "Search for new characters: %s\n", next_simd_ptr);
 				index = findFirstDelimiter(cur_ptr, line_end_ptr - cur_ptr, delimiters, delimiters_len);
 
 				//elog(DEBUG1, "INDEX: %d", index);
 				//elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
-//				elog(DEBUG1, "cur_ptr2: %s", cur_ptr);
-//				elog(DEBUG1, "simd_count2: %d", simd_count);
-//				elog(DEBUG1, "indexes_count2: %d", indexes_count);
-//				elog(DEBUG1, "simd_ptr2: %s", simd_ptr);
-//				elog(DEBUG1, "indexes2:");
+				//elog(DEBUG1, "cur_ptr2: %s", cur_ptr);
+				//elog(DEBUG1, "indexes2:");
 //				for (i=0; i<indexes_count; ++i) {
-//					elog(DEBUG1, "%d: ", indexes[i]);
+//					//elog(DEBUG1, "%d: ", indexes[i]);
 //				}
 				/*
 				 * There can be the case that no more characters can be searched
@@ -5340,6 +5335,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 					//elog(DEBUG1, "copied character: %c", *cur_ptr);
 					*output_ptr++ = *cur_ptr++;
 				}
+				end_ptr = cur_ptr;
 				//++simd_ptr;
 #else // end of: USE_SSE
 				/* at the end of the field processing it should point to the
@@ -5372,7 +5368,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 					break; /* this break moves you to the "In quote" loop */
 				}
 				/* Add c to output string */
-//				elog(DEBUG1, "copied character: %c", c);
+				//elog(DEBUG1, "copied character: %c", c);
 				*output_ptr++ = c;
 #endif
 			}
@@ -5421,7 +5417,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 
 		/* Terminate attribute value in output area. */
 		*output_ptr++ = '\0';
-//		elog(DEBUG1, "field data: %s", cstate->raw_fields[fieldno]);
+		//elog(DEBUG1, "field data: %s", cstate->raw_fields[fieldno]);
 		/* Check whether raw input matched null marker.
 		 *
 		 * Adam: cstate->null_print is the NULL marker string (server encoding!)
