@@ -2940,6 +2940,9 @@ static uint64 CopyFrom(CopyState cstate) {
 
 	/* Adam: check if the debugging mode works. */
 	elog(DEBUG1, "Begin the CopyFrom method.");
+	#ifdef USE_SSE
+	elog(DEBUG1, "USE SSE");
+	#endif // USE_SSE
 	getTime(&startCopy,NULL);
 	/* initialize the stats */
 	cstate->parse = 0.0;
