@@ -59,6 +59,7 @@
 
 /* Specify if you want to use the SIMD instructions. */
 #define USE_SSE
+//#define USE_SSE2
 
 #ifdef USE_SSE
 
@@ -2943,6 +2944,10 @@ static uint64 CopyFrom(CopyState cstate) {
 	#ifdef USE_SSE
 	elog(DEBUG1, "USE SSE");
 	#endif // USE_SSE
+	#ifdef USE_SSE2
+	elog(DEBUG1, "USE SSE2");
+	#endif // USE_SSE2
+
 	getTime(&startCopy,NULL);
 	/* initialize the stats */
 	cstate->parse = 0.0;
@@ -4810,7 +4815,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 	/* Adam: The pointer to the end of the line buffer. */
 	char *line_end_ptr;
 
-	#ifdef USE_SSE
+	#ifdef USE_SSE2
 		int indexes[N_CHAR_SIMD] = {}; /* new index for a found delimiter - by SIMD instruction */
 		int indexes_count = 0; /* how many indices were found */
 		int simd_count = 0; /* to which position in the simd indexes we reached */
@@ -4864,7 +4869,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 	/* Adam: line_end_ptr - is to the end of the line buffer. */
 	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
 
-	#ifdef USE_SSE
+	#ifdef USE_SSE2
 		raw_delimiters[delimiters_len++] = delimc;
 		if (quotec != '\0') {
 			raw_delimiters[delimiters_len++] = quotec;
@@ -4929,7 +4934,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 				 * line from cstate->line_buf.data, but at the same time if the
 				 * line finished then you also finished processing of this very
 				 * field. */
-#ifdef USE_SSE
+#ifdef USE_SSE2
 				/**
 				 * If cur_ptr reached the end of buffer then do nothing.
 				 *
@@ -5025,7 +5030,7 @@ static int CopyReadAttributesCSV(CopyState cstate) {
 					found_delim = true;
 					goto endfield;
 				}
-#ifdef USE_SSE
+#ifdef USE_SSE2
 				/* start of quoted field (or part of a field) */
 				else {
 //					//elog(DEBUG1, "character not line delimiter: %c", c);
@@ -5158,7 +5163,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 	/* Adam: The pointer to the end of the line buffer. */
 	char *line_end_ptr;
 
-	#ifdef USE_SSE
+	#ifdef USE_SSE2
 		char * simd_ptr; // next simd delimiter pointer
 
 		__m128i delimiters; /* the delimiters that we are searching for in the SIMD format */
@@ -5205,7 +5210,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 	/* Adam: line_end_ptr - is to the end of the line buffer. */
 	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
 
-	#ifdef USE_SSE
+	#ifdef USE_SSE2
 		raw_delimiters[delimiters_len++] = delimc;
 		if (quotec != '\0') {
 			raw_delimiters[delimiters_len++] = quotec;
@@ -5268,7 +5273,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 				 * line from cstate->line_buf.data, but at the same time if the
 				 * line finished then you also finished processing of this very
 				 * field. */
-#ifdef USE_SSE
+#ifdef USE_SSE2
 				/**
 				 * If cur_ptr reached the end of buffer then do nothing.
 				 *
@@ -5355,7 +5360,7 @@ static int CopyReadAttributesCSV2(CopyState cstate) {
 					found_delim = true;
 					goto endfield;
 				}
-#ifdef USE_SSE
+#ifdef USE_SSE2
 				/* start of quoted field (or part of a field) */
 				else {
 					//elog(DEBUG1, "character not line delimiter: %c", c);
