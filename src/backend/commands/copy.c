@@ -58,7 +58,7 @@
 #define DEBUG_TIME true
 
 /* Specify if you want to use the SIMD instructions. */
-#define USE_SSE
+//#define USE_SSE
 //#define USE_SSE2
 
 #ifdef USE_SSE
